@@ -182,6 +182,23 @@ PRODUCT_CATEGORIES = [
     "shirts", "shorts", "lingerie", "etc."
 ]
 
+SIZE_CHART_TEXT = """# Size Chart
+Letter | US | UK | EU | Bust | Waist | Hip
+XS | 0–2 | 4–6 | 32–34 | 31–32 in | 24–25 in | 33–34 in
+S  | 4–6 | 8–10 | 36–38 | 33–34 in | 26–27 in | 35–36 in
+M  | 8–10 | 12–14 | 40–42 | 35–36 in | 28–29 in | 37–38 in
+L  | 12–14 | 16–18 | 44–46 | 37–39 in | 30–32 in | 39–41 in
+XL | 16–18 | 20–22 | 48–50 | 40–42 in | 33–35 in | 42–44 in
+
+## Measuring Tips (quick)
+- Bust: fullest part, tape parallel to floor.
+- Waist: natural waistline (between rib and hip).
+- Hip: fullest part, feet together.
+
+## Fit Guidance Defaults
+- Unless noted, most items run **true to size**.
+- If between sizes, prefer the larger size for woven/non-stretch; smaller for knit/stretch.
+"""
 
 # =========================
 # Regex & Extractors
@@ -190,13 +207,8 @@ YES_PAT = re.compile(r"\b(yes|yeah|yep|sure|ok|okay|please)\b", re.I)
 NO_PAT  = re.compile(r"\b(no|nope|nah|not now|later)\b", re.I)
 
 def _is_size_chart_query(t: str) -> bool:
-    """Detects 'size chart/guide' style questions anywhere in the text."""
     return bool(re.search(
-        r"\b("
-        r"size\s*(chart|guide)|sizing\s*(chart|guide)?|size\s*info|measurement(s)?"
-        r"|size\s*range|available\s*sizes?|what\s*sizes?\s*do\s*you\s*offer"
-        r"|do\s*you\s*have\s*(xs|s|m|l|xl|xxl)|offer\s*sizes?"
-        r")\b",
+        r"\b(size\s*(chart|guide)|sizing\s*(chart|guide)?|size\s*info|measurement(s)?)\b",
         t or "", re.I
     ))
 
@@ -1060,7 +1072,16 @@ def inline_answer_rewards(user_text: str) -> str:
     return answer_with_rag(user_text, retrieval_hint="rewards membership points tiers redeem expiration")
 
 def inline_answer_size_chart(user_text: str) -> str:
-    return answer_with_rag(user_text, retrieval_hint="size chart size guide measurements bust waist hip")
+    # Streamlit markdown table 렌더링 구분선 추가
+    lines = SIZE_CHART_TEXT.strip().splitlines()
+    out = []
+    inserted = False
+    for line in lines:
+        out.append(line)
+        if (not inserted) and line.strip().lower().startswith("letter |"):
+            out.append("|---|---|---|---|---|---|---|")
+            inserted = True
+    return "\n".join(out)
 
 def inline_answer_new_arrivals(user_text: str) -> str:
     return answer_with_rag(user_text, retrieval_hint="new arrivals collection lineup items colors categories")
