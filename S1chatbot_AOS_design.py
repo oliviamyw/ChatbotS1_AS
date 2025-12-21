@@ -1,6 +1,7 @@
 # =========================
 # Chatbot App with Name and Picture + Start-up — RAG + Rules + Pending Intents
 # Natural UI flow (no explicit step sections)
+# FULL VERSION (UPDATED): RAG-grounded factual answers + LLM natural responses
 # =========================
 
 # --- Imports ---
@@ -9,6 +10,7 @@ import re
 import uuid
 import datetime
 from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple
 
 import streamlit as st
 from openai import OpenAI
@@ -103,7 +105,7 @@ st.markdown(
 
 
 # =========================
-# Identity
+# Identity (single-condition file)
 # =========================
 identity_option = "With name and image"
 show_name = True
@@ -113,7 +115,7 @@ CHATBOT_PICTURE = "https://i.imgur.com/4uLz4FZ.png"
 brand_type = "Start-up Brand"
 
 def _chatbot_speaker():
-    return CHATBOT_NAME
+    return CHATBOT_NAME if show_name else "Assistant"
 
 if show_picture:
     try:
@@ -143,8 +145,8 @@ if not st.session_state.session_meta_logged:
         "ts_start": datetime.datetime.utcnow().isoformat() + "Z",
         "identity_option": identity_option,
         "brand_type": brand_type,
-        "name_present": "present",
-        "picture_present": "present",
+        "name_present": "present" if show_name else "absent",
+        "picture_present": "present" if show_picture else "absent",
         "scenario": st.session_state.flow.get("scenario") or None,
         "user_turns": st.session_state.user_turns,
         "bot_turns": st.session_state.bot_turns,
@@ -169,6 +171,9 @@ TONE_STYLE = {
     # formal: 이모지 금지
     "formal": "Use a formal, respectful tone. No emojis."
 }
+
+def tone_instruction() -> str:
+    return TONE_STYLE.get(TONE, TONE_STYLE["informal"])
 
 PRODUCT_CATEGORIES = [
     "blouse", "skirt", "pants", "cardigans / sweaters", "dresses",
@@ -197,12 +202,12 @@ def _preprocess_user_text(t: str) -> str:
 
     # 공백/슬래시 정리
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\s*/\s*", " / ", s)  # "City Knit / s" → "City Knit / s"
+    s = re.sub(r"\s*/\s*", " / ", s)
 
-    # 계절/수식어(제품 추론에 불필요) 제거
+    # 계절/수식어 제거 (retrieval에 도움되는 경우가 있어 완전 삭제 대신 약하게 정리)
+    # 단, user meaning을 깨는 수준의 삭제는 피함.
     seasonals = [
-        r"\bfall\b", r"\bautumn\b", r"\bwinter\b", r"\bspring\b", r"\bsummer\b",
-        r"\bnew\b", r"\blatest\b", r"\brecent\b", r"\bcollection\b", r"\bnew\s+arrivals?\b"
+        r"\bnew arrivals?\b", r"\blatest\b", r"\brecent\b"
     ]
     for pat in seasonals:
         s = re.sub(pat, " ", s, flags=re.I)
@@ -216,7 +221,7 @@ def _preprocess_user_text(t: str) -> str:
     for pat, repl in fixes.items():
         s = re.sub(pat, repl, s, flags=re.I)
 
-    # 대표 제품명은 대소문자 섞여도 표준 표기로 정규화
+    # 대표 제품명 표준화
     s = re.sub(r"\bcity\s+knit\b", "City Knit", s, flags=re.I)
     s = re.sub(r"\bsoft\s+blouse\b", "Soft Blouse", s, flags=re.I)
     s = re.sub(r"\beveryday\s+jacket\b", "Everyday Jacket", s, flags=re.I)
@@ -252,33 +257,22 @@ def extract_product(t: str):
     text = _preprocess_user_text(t)
     low = text.lower()
 
-    # 1) 명명된 라인업(정확 표기 우선)
-    named = [
-        "City Knit",
-        "Soft Blouse",
-        "Everyday Jacket",
-        "Tailored Pants",
-        "Weekend Dress",
-    ]
+    named = ["City Knit", "Soft Blouse", "Everyday Jacket", "Tailored Pants", "Weekend Dress"]
     for name in named:
         if re.search(rf"\b{re.escape(name)}\b", text, re.I):
             return name
 
-    # 2) 느슨한 키워드/동의어 → 대표 카테고리로 매핑
-    #    예: knit → sweater (City Knit가 문맥에 있으면 City Knit)
     if "knit" in low:
-        if "city" in low:   # "city knit", "city blue knit" 등
+        if "city" in low:
             return "City Knit"
-        return "sweater"     # 일반 니트는 스웨터로 표준화
+        return "sweater"
 
     if "tee" in low or "t-shirt" in low or "tshirt" in low:
         return "t-shirt"
 
-    # ✅ shoes / sneakers 인식
     if re.search(r"\b(running\s+shoes?|sneakers?|shoes?)\b", low, re.I):
         return "shoes"
 
-    # 3) 일반 카테고리(복수형은 단수로 정규화)
     cats = [
         "blouse", "skirt", "pants", "cardigan", "cardigans", "sweater", "sweaters",
         "dress", "dresses", "jumpsuit", "jumpsuits", "jacket", "jackets",
@@ -292,11 +286,10 @@ def extract_product(t: str):
                 return c.rstrip("s")
             return c
 
-    # 4) 두 단어 조합(느슨): "chunky knit sweater", "leather jacket" 등
     w = re.search(r"\b([\w\-]+(?:\s+[\w\-]+)?)\s+(jacket|skirt|blouse|t-?shirt|dress|pants|sweater|shoes)\b", text, re.I)
     if w:
         noun = w.group(2).lower()
-        if noun == "t-shirt":
+        if noun in ("tshirt", "t-shirt"):
             return "t-shirt"
         if noun == "sweater":
             return "sweater"
@@ -345,16 +338,13 @@ def build_or_load_vectorstore(rag_dir: str):
     persist_dir = str(rag_path / ".chroma")
     embeddings = OpenAIEmbeddings(api_key=API_KEY, model="text-embedding-3-small")
 
-    # Try loading existing index first
     if Path(persist_dir).exists() and any(Path(persist_dir).iterdir()):
         try:
             return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
         except Exception as e:
             st.warning(f"Vectorstore load warning: {e}")
 
-    # === changed: load only human-authored text/markdown docs ===
     try:
-        # Load .txt first
         loader = DirectoryLoader(
             rag_dir,
             glob="**/*.txt",
@@ -363,7 +353,6 @@ def build_or_load_vectorstore(rag_dir: str):
             show_progress=True,
             use_multithreading=True,
         )
-        # Optionally add .md files as well
         try:
             md_loader = DirectoryLoader(
                 rag_dir,
@@ -379,7 +368,6 @@ def build_or_load_vectorstore(rag_dir: str):
     except Exception as e:
         st.warning(f"RAG documents could not be loaded: {e}")
         return None
-    # === end changed ===
 
     if not docs:
         return None
@@ -402,6 +390,33 @@ def build_or_load_vectorstore(rag_dir: str):
 
 vectorstore = build_or_load_vectorstore(RAG_DIR)
 
+# ---- UPDATED: retrieval query is "doc-friendly" + optional hint ----
+def make_query(user_message: str, retrieval_hint: Optional[str] = None) -> str:
+    """
+    Retrieval query should be document-friendly.
+    Keep it close to natural language + salient slot values + optional hint.
+    Avoid long meta fields (scenario:, intent:, etc.) that add noise.
+    """
+    slots = st.session_state.flow.get("slots", {})
+    text = _preprocess_user_text(user_message)
+
+    parts = [text]
+    if slots.get("product"):
+        parts.append(str(slots["product"]))
+    if slots.get("color"):
+        parts.append(str(slots["color"]))
+    if slots.get("size"):
+        parts.append(str(slots["size"]))
+
+    if retrieval_hint:
+        parts.append(retrieval_hint)
+
+    # mild signal for collection queries
+    if re.search(r"\b(new|latest|collection|arrivals?)\b", text, re.I):
+        parts.append("collection")
+
+    return " ".join([p for p in parts if p]).strip()
+
 def retrieve_context(query: str, k: int = 6) -> str:
     if not vectorstore:
         return ""
@@ -410,122 +425,140 @@ def retrieve_context(query: str, k: int = 6) -> str:
     except Exception as e:
         st.warning(f"Similarity search failed: {e}")
         return ""
+    if not hits:
+        return ""
+
     blocks = []
     for i, d in enumerate(hits, 1):
         src = d.metadata.get("source", "unknown")
         blocks.append(f"[Doc{i} from {os.path.basename(src)}]\n{d.page_content.strip()}")
     return "\n\n".join(blocks)
 
-# === changed: enrich query with scenario/intent & hints ===
-def make_query(user_message: str) -> str:
-    slots = st.session_state.flow["slots"]
-    scenario = st.session_state.flow.get("scenario")
-    intent = detect_global_intent(user_message)
-    intent_key = intent["key"] if intent else None
-
-    parts = []
-    if scenario:
-        parts.append(f"scenario:{scenario}")
-    if intent_key:
-        parts.append(f"intent:{intent_key}")
-
-    if slots.get("product"): parts.append(f"product:{slots['product']}")
-    if slots.get("color"):   parts.append(f"color:{slots['color']}")
-    if slots.get("size"):    parts.append(f"size:{slots['size']}")
-
-    # light hints to steer retrieval to the right doc
-    text = _preprocess_user_text(user_message)
-    hint_terms = []
-    if intent_key == "new_arrivals_intent":
-        hint_terms += ["new arrivals", "new collection", "latest drop", "fall collection", "winter collection"]
-    if intent_key == "promotions_intent":
-        hint_terms += ["promotions", "discounts", "WELCOME10", "stacking", "first-time 5%"]
-    if intent_key == "price_intent":
-        hint_terms += ["price range", "typical ranges", "tees", "knitwear", "jackets", "dresses"]
-    if intent_key == "free_returns_intent":
-        hint_terms += ["free returns", "return shipping covered"]
-    if intent_key == "mens_catalog_intent":
-        hint_terms += ["men and women", "men's categories", "shirts", "pants", "jackets", "knitwear"]
-
-    if hint_terms:
-        parts.append("hints:" + ",".join(hint_terms))
-
-    parts.append(f"user:{text}")
-    return " | ".join(parts)
-# === end changed ===
-
 
 # =========================
-# LLM (RAG) fallback
+# LLM (RAG) — UPDATED: RAG-first rules + conversation context
 # =========================
+_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]+")
 
-def answer_with_rag(user_message: str) -> str:
-    # 슬롯 업데이트
+def apply_tone_policies(text: str) -> str:
+    """
+    Tone policy:
+    - formal: remove all emojis
+    - informal: keep at most one emoji and move it to the very end
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    if TONE == "formal":
+        return _EMOJI_RE.sub("", text)
+
+    emojis = list(_EMOJI_RE.finditer(text))
+    if not emojis:
+        return text
+
+    first_emoji = emojis[0].group(0)
+    cleaned = _EMOJI_RE.sub("", text).rstrip()
+
+    if cleaned and cleaned[-1] in ".!?":
+        return f"{cleaned} {first_emoji}"
+    return f"{cleaned} {first_emoji}"
+
+def _recent_messages_for_llm(user_message: str, max_pairs: int = 6) -> List[Dict[str, str]]:
+    """
+    Include a small recent window of conversation for coherence,
+    while avoiding duplication of the current user message.
+    """
+    hist: List[Tuple[str, str]] = st.session_state.chat_history or []
+
+    # If the last entry is the same user message, exclude it to avoid duplication
+    if hist and hist[-1][0] == "User" and (hist[-1][1] or "").strip() == (user_message or "").strip():
+        hist = hist[:-1]
+
+    # Take last N messages (approx pairs)
+    window = hist[-(max_pairs * 2):] if len(hist) > max_pairs * 2 else hist
+
+    msgs: List[Dict[str, str]] = []
+    for spk, msg in window:
+        if spk == "User":
+            msgs.append({"role": "user", "content": msg})
+        else:
+            # any bot speaker -> assistant
+            msgs.append({"role": "assistant", "content": msg})
+    return msgs
+
+def answer_with_rag(user_message: str, retrieval_hint: Optional[str] = None) -> str:
     _update_slots_from_text(user_message)
 
-    # RAG 조회
-    query = make_query(user_message)
+    query = make_query(user_message, retrieval_hint=retrieval_hint)
     context = retrieve_context(query, k=6)
+    has_context = bool((context or "").strip())
 
-    # --- Style instruction 안전 획득 ---
-    # tone_instruction() 헬퍼가 있으면 사용, 없거나 오타면 TONE_STYLE로 폴백
-    try:
-        style_instruction = tone_instruction()  # 헬퍼가 정상 정의되어 있으면 이 줄이 실행됨
-    except NameError:
-        # 헬퍼 없음/오타 ↔ 안전 폴백
-        try:
-            style_instruction = TONE_STYLE.get(TONE, TONE_STYLE["informal"])
-        except Exception:
-            # 최후 폴백(사전 자체가 없다면)
-            style_instruction = "Use a friendly, casual tone. Use emojis."
+    style_instruction = tone_instruction()
 
-    # 세션 상태 방어적 참조
-    flow = getattr(st.session_state, "flow", {}) or {}
+    flow = st.session_state.flow or {}
     known_slots = flow.get("slots", {})
     current_scenario = flow.get("scenario")
+    current_stage = flow.get("stage")
 
-    bot_identity = f"named {CHATBOT_NAME}" if show_name else "with no name"
+    # Identity string for experimental condition
+    bot_identity = f"a customer service chatbot named {CHATBOT_NAME}" if show_name else "a customer service chatbot"
 
-    prompt = f"""
-You are a helpful customer service chatbot {bot_identity} for Style Loom.
-Ground every answer in the BUSINESS CONTEXT. If critical info is missing, ask **one concise follow-up question** only.
-Do not invent policy, numbers, or SKUs. Keep answers short and helpful.
+    # RAG-first rules: prevents “막힘” and forces summarization when context exists
+    system_rules = (
+        "You are a helpful customer service chatbot for Style Loom.\n\n"
+        "CRITICAL RULES (follow in order):\n"
+        "1) If the user asks about products, colors, collections, sizing, shipping, returns, rewards, promotions, pricing, or brand offerings, "
+        "you MUST first use the BUSINESS CONTEXT provided.\n"
+        "2) If the BUSINESS CONTEXT contains relevant information, answer directly by summarizing it in your own words (do not quote long passages).\n"
+        "3) If only partial information is available, provide what is known and then ask ONE concise follow-up question.\n"
+        "4) Ask ONE follow-up question ONLY when the BUSINESS CONTEXT truly lacks the needed information.\n"
+        "5) Do NOT invent policy details, numbers, SKUs, prices, or inventory counts.\n"
+        "6) Keep the answer short, natural, and helpful.\n"
+    )
 
-=== BUSINESS CONTEXT (retrieved) ===
-{context if context else "[no docs retrieved]"}
-=== END CONTEXT ===
+    meta_block = (
+        f"Meta:\n"
+        f"- Current scenario: {current_scenario}\n"
+        f"- Current stage: {current_stage}\n"
+        f"- Known slots: {known_slots}\n"
+        f"- Product categories: {', '.join(PRODUCT_CATEGORIES)}\n"
+    )
 
-Meta:
-- Current scenario: {current_scenario}
-- Product categories: {", ".join(PRODUCT_CATEGORIES)}
-- Known slots: {known_slots}
+    context_block = context if has_context else (
+        "[No document snippets were retrieved for this query. "
+        "Provide only general guidance and ask one concise follow-up question if needed.]"
+    )
 
-Style:
-{style_instruction}
-
-User: {user_message}
-Chatbot:
-""".strip()
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": system_rules},
+        {"role": "system", "content": meta_block},
+        {"role": "system", "content": f"Style:\n{style_instruction}"},
+        {"role": "system", "content": f"BUSINESS CONTEXT (retrieved):\n{context_block}"},
+    ]
+    messages += _recent_messages_for_llm(user_message, max_pairs=6)
+    messages += [{"role": "user", "content": user_message}]
 
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=0.3,
+            top_p=1,
         )
-        return resp.choices[0].message.content
+        return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         st.warning(f"LLM call failed: {e}")
         return "Sorry, I had trouble generating a response. Could you rephrase your question?"
 
 def llm_fallback(user_message: str) -> str:
+    # Generic fallback uses no extra retrieval hint
     return answer_with_rag(user_message)
+
 
 # =========================
 # Pending yes/no logic (global)
 # =========================
 def set_pending(intent: str, data: dict | None = None):
-    # 불필요한 중첩 제거: {"intent": ..., "data": {...}} 한 단계만 유지
     st.session_state.pending = {"intent": intent, "data": (data or {})}
 
 def consume_pending():
@@ -543,17 +576,14 @@ def handle_pending_yes(user_text: str) -> str | None:
     if not intent:
         return None
 
+    # YES branch
     if YES_PAT.search(user_text):
         if intent == "rewards_more":
             consume_pending()
-            return (
-                "**Rewards at a glance**\n"
-                "- **Earning:** 1 pt per $1 spent (Bronze). Silver 1.5× (≥ $300/yr), "
-                "Gold 2× + Free Express (≥ $800/yr), VIP 2× + Free Express + Gifts (≥ $1,500/yr)\n"
-                "- **Redemption:** 100 pts = $1 off. Applies to **merchandise subtotal only** (no tax/shipping).\n"
-                "- **Tier window:** Rolling 12 months; downgrades if you fall below thresholds at review.\n"
-                "- **Expiration:** Points expire after **12 months** of no earn/redeem activity.\n"
-                "Would you like tips on **earning faster** or **redeeming** now?"
+            # Use RAG to answer details (not hardcoded). Provide retrieval hint.
+            return answer_with_rag(
+                "Please explain how the rewards/membership program works: earning, tiers, redemption, expiration, and shipping perks, based on policy.",
+                retrieval_hint="rewards membership points tiers redemption expiration free express shipping"
             )
 
         if intent == "colors_sizes_more":
@@ -562,26 +592,17 @@ def handle_pending_yes(user_text: str) -> str | None:
             color = slots.get("color")
             size  = slots.get("size")
             consume_pending()
-            size_line = (
-                f"For the {product}, typical sizes in stock run XXS–XXL."
-                if not size else
-                f"For the {product}, size **{size}** is commonly stocked; adjacent sizes are often available."
-            )
-            color_line = (
-                f"Common colors include black, white, beige, navy, brown, and seasonal drops."
-                if not color else
-                f"Alongside **{color}**, we usually carry black, white, beige, navy, and seasonal colors."
-            )
-            return (
-                f"**Availability guide for {product}**\n"
-                f"- {size_line}\n"
-                f"- {color_line}\n"
-                "Would you like me to check a **specific color/size** now?"
-            )
+            q = f"Please describe available colors and sizes for {product}"
+            if color:
+                q += f" in {color}"
+            if size:
+                q += f" size {size}"
+            q += ", and how to check availability."
+            return answer_with_rag(q, retrieval_hint="availability colors sizes inventory how to check")
 
         if intent == "confirm_switch":
             pend_consumed = consume_pending()
-            target = pend_consumed["data"].get("target")  # ✅ 여기! data["data"] 아님
+            target = pend_consumed["data"].get("target")
             if target:
                 st.session_state.flow = {
                     "scenario": target, "stage": "start",
@@ -590,10 +611,10 @@ def handle_pending_yes(user_text: str) -> str | None:
                 return f"Great—switching to **{target}**. How can I help within this topic?"
             return "Okay—switching contexts."
 
-        # 기타 펜딩 의도에 대해 기본 응답
         consume_pending()
         return "Got it."
 
+    # NO branch
     if NO_PAT.search(user_text):
         if intent == "confirm_switch":
             consume_pending()
@@ -618,17 +639,16 @@ def infer_pending_from_bot_reply(reply_text: str) -> None:
 
     if sc == "Rewards & membership":
         if _match_any([
-            r"\bwant to know\b.*\b(earn|earning|redeem|redemption|points|rewards)\b",
-            r"\bwould you like\b.*\b(earn|earning|redeem|redemption|points|rewards)\b",
+            r"\bwould you like\b",
+            r"\bdo you want\b",
         ]):
             set_pending("rewards_more")
             return
 
-    if sc in ("Check product availability", "Size & fit guidance"):
+    if sc in ("Check product availability", "Size & fit guidance", "New arrivals & collections"):
         if _match_any([
-            r"\bwant to know\b.*\b(color|colors|size|sizes)\b",
-            r"\binterested in\b.*\b(color|colors|size|sizes)\b",
-            r"\bwould you like\b.*\b(color|colors|size|sizes)\b",
+            r"\bwould you like\b",
+            r"\bdo you want\b",
         ]):
             set_pending("colors_sizes_more")
             return
@@ -644,36 +664,32 @@ except NameError:
     def _is_shipping_query(t: str) -> bool:
         """Detect shipping/delivery questions (exclude 'free return(s)' and 'return shipping')."""
         text = (t or "")
-        # exclude explicit free-returns phrasing so it doesn't fall into generic shipping
         if re.search(r"\bfree\s+return(s)?(\s+shipping)?\b", text, re.I):
             return False
         if re.search(r"\breturn\s+shipping\b", text, re.I):
             return False
         return bool(re.search(
             r"\b(ship|shipping|deliver(y|ed|ing)?|eta|track(ing)?|when\s+will\s+it\s+(arrive|be\s+delivered)|how\s+long.*(deliver|shipping|arrive))\b",
-            text,
-            re.I
+            text, re.I
         ))
+
 
 # =========================
 # Helpers for pattern matching & avoiding repetition
 # =========================
-
 def _any(patterns, text):
-    """Return True if any regex in list matches the text."""
     return any(re.search(p, text or "", re.I) for p in patterns)
 
 def maybe_dedupe_reply(reply: str) -> str:
-    """Avoid repeating the exact same bot message consecutively."""
     hist = st.session_state.chat_history or []
     last_bot = next((m for (spk, m) in reversed(hist) if spk == _chatbot_speaker()), None)
     if last_bot and last_bot.strip() == reply.strip():
-        # add a light variation to make it sound natural
         return reply + "\n\nWould you like to narrow by a category or color?"
     return reply
 
+
 # =========================
-# Rule-based scenario router
+# Rule-based scenario router (UPDATED: facts answered via RAG)
 # =========================
 def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
     flow = st.session_state.flow
@@ -682,57 +698,56 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
 
     _update_slots_from_text(user_text)
 
+    # ---- About the brand ----
+    if current_scenario == "About the brand":
+        flow["stage"] = "end_or_more"
+        return answer_with_rag(
+            user_text,
+            retrieval_hint="brand story about style loom start-up founded mission positioning values"
+        )
+
     # ---- Rewards & membership ----
     if current_scenario == "Rewards & membership":
         if stage in (None, "start"):
             flow["stage"] = "rewards_intro"
-            return ask_yesno(
-                intent="rewards_more",
-                message=(
-                    "Every 100 points = $1 off your next order (merchandise subtotal only). "
-                    "Tiers are based on a rolling 12-month spend, and points expire after 12 months of inactivity. "
-                    "Would you like to know more about earning or redeeming points?"
-                )
+            # Provide short helpful start + offer details
+            intro = answer_with_rag(
+                "Give a brief overview of the rewards/membership program and ask if the user wants earning or redemption details.",
+                retrieval_hint="rewards membership overview points tiers redeem expiration"
             )
+            return ask_yesno("rewards_more", intro)
 
-        # ✅ NEW: "free shipping?"
-        if re.search(r"\bfree\s+(express\s+)?shipping\b", user_text, re.I):
-            return (
-                "Gold includes **Free Express Shipping** (≥ $800/year). "
-                "VIP also includes Free Express plus gifts (≥ $1,500/year)."
+        # Any follow-up in this scenario -> use RAG
+        flow["stage"] = "end_or_more"
+        return answer_with_rag(
+            user_text,
+            retrieval_hint="rewards membership points tiers redeem expiration free express shipping"
+        )
+
+    # ---- Discounts & promotions ----
+    if current_scenario == "Discounts & promotions":
+        flow["stage"] = "end_or_more"
+        return answer_with_rag(
+            user_text,
+            retrieval_hint="promotions discounts coupon codes exclusions stacking order of operations"
+        )
+
+    # ---- New arrivals & collections ----
+    if current_scenario == "New arrivals & collections":
+        text = _preprocess_user_text(user_text)
+
+        if stage in (None, "start"):
+            flow["stage"] = "new_intro"
+            return "Looking for a category or a color from the new collection?"
+
+        # Use RAG to answer lineup/colors; keep natural and ask 1 follow-up if needed
+        flow["stage"] = "end_or_more"
+        return maybe_dedupe_reply(
+            answer_with_rag(
+                text,
+                retrieval_hint="new arrivals collection lineup items colors categories"
             )
-
-        # ✅ NEW: "how do I get to VIP faster?" 
-        if (
-            re.search(r"\b(get|reach|make|hit|unlock)\b.*\bvip\b.*\b(fast|faster|quick|quickly|sooner)\b", user_text, re.I)
-            or re.search(r"\bvip\b.*\b(fast|faster|quick|quickly|sooner)\b", user_text, re.I)
-        ):
-            return (
-                "**Getting to VIP faster:**\n"
-                "- Consolidate purchases on one account (points apply to the discounted subtotal).\n"
-                "- Shop during promos; points still apply to the **discounted** subtotal.\n"
-                "- Gold starts at **$800/yr** (2× points); VIP at **$1,500/yr** (2× + Free Express + gifts)."
-            )
-
-        # prior logic
-        if re.search(r"\b(earn|earning|accumulate|faster)\b", user_text, re.I):
-            return (
-                "**Earning faster:**\n"
-                "- Silver: 1.5× points (≥ $300/year)\n"
-                "- Gold: 2× points + Free Express (≥ $800/year)\n"
-                "- VIP: 2× points + Free Express + Gifts (≥ $1,500/year)\n"
-                "Promotions may stack, but points apply to the **discounted subtotal**."
-            )
-
-        if re.search(r"\b(redeem|redemption|use points|apply points)\b", user_text, re.I):
-            return (
-                "**Redeeming points:**\n"
-                "- 100 pts = $1 off\n"
-                "- Apply at checkout (payment step)\n"
-                "- Points do not apply to taxes or shipping"
-            )
-
-        return None
+        )
 
     # ---- Check product availability ----
     if current_scenario == "Check product availability":
@@ -742,182 +757,61 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
 
         if stage == "collect":
             if not slots.get("product"):
-                _update_slots_from_text(user_text)
-            if not slots.get("product"):
                 return "Sure—what product are you looking for (e.g., jacket, dress, t-shirt)?"
             if not slots.get("color"):
                 return f"Great—what color of {slots['product']}?"
             if not slots.get("size"):
                 return f"What size for the {slots['product']} in {slots['color']}?"
-            flow["stage"] = "offer_low_stock_alt"
-            return ask_yesno(
-                intent="colors_sizes_more",
-                message=(
-                    f"We have 5+ in stock for the {slots['product']} in {slots['color']} / {slots['size']}. "
-                    "However, another color is running low in stock. Would you like me to suggest a low-stock option?"
-                ),
-                data={"slots_snapshot": slots.copy()}
-            )
 
-        if stage == "offer_low_stock_alt":
-            if YES_PAT.search(user_text):
-                flow["stage"] = "end_or_more"
-                return (
-                    f"A similar last-season {slots['product']} in {slots['color']} is down to the final 2 pieces. "
-                    "Would you like a restock alert or see similar styles?"
-                )
-            if NO_PAT.search(user_text):
-                flow["stage"] = "end_or_more"
-                return "All set! Anything else you’d like to check?"
-            return "Would you like me to suggest a similar low-stock option?"
+            # Now we have enough; use RAG to respond naturally (avoid inventing exact counts)
+            flow["stage"] = "end_or_more"
+            q = (
+                f"The user wants to check availability for {slots['product']} in {slots['color']} size {slots['size']}. "
+                f"Based on inventory/availability policy, explain how to confirm stock and suggest what to do if low stock."
+            )
+            return answer_with_rag(q, retrieval_hint="availability in stock low stock restock alert variants")
 
         if stage == "end_or_more":
             return "Happy to help. Anything else you’d like to check?"
         return None
 
-    # ---- New arrivals & collections ----
-    if current_scenario == "New arrivals & collections":
-        text = _preprocess_user_text(user_text)
-        low = text.lower()
+    # ---- Size & fit guidance ----
+    if current_scenario == "Size & fit guidance":
+        if _is_size_chart_query(user_text):
+            flow["stage"] = "end_or_more"
+            # Pull size guide info from RAG docs rather than hardcoded chart
+            return answer_with_rag(
+                "Please provide the size guide/size chart information and where to find it on the product page.",
+                retrieval_hint="size guide size chart measurements bust waist hip inseam fit notes"
+            )
 
-        # slots from free text (so we can branch to availability if user already gave color/size)
-        prod  = extract_product(text)
-        color = extract_color(text)
-        size  = extract_size(text)
-
-        # 1) 첫 진입: 한 번만 핀포인트 질문
         if stage in (None, "start"):
-            flow["stage"] = "new_intro"
-            return "Looking for a category or a color from the new collection?"
+            flow["stage"] = "fit_collect"
+            return "Sure—tell me your current size and how it fits."
 
-        # 2) 새 드롭 아이템 요약(문장형) — 카테고리 키 → 요약문
-        summaries = {
-            # 표준 카테고리 키
-            "blouse":  "Soft Blouse — softly draped cotton-modal. Colors: Ivory, Mist Blue, Rose Beige, Black.",
-            "sweater": "City Knit — cozy wool-blend textures. Colors: Oatmeal, Charcoal, Forest, Pink.",
-            "jacket":  "Everyday Jacket — clean tailoring in twill/nylon. Colors: Sand, Navy, Olive.",
-            "pants":   "Tailored Pants — stretch twill, streamlined lines. Colors: Black, Greige, Navy.",
-            "dress":   "Weekend Dress — fluid modal jersey. Colors: Berry, Ink, Cream.",
-        }
-        # 이름/동의어 → 표준 키
-        to_key = {
-            "city knit": "sweater",
-            "cardigan": "sweater",
-            "knit": "sweater",
-            "blouses": "blouse",
-            "dresses": "dress",
-            "trousers": "pants",
-            "t-shirt": "tshirt", "t-shirt": "tshirt", "tee": "tshirt", "tees":"tshirt",
-        }
-        # extract_product가 이름(예: City Knit)이나 복수형을 줄 수 있어 보정
-        if prod:
-            p = prod.lower()
-            prod_key = to_key.get(p, p)
-        else:
-            prod_key = None
-
-        # 3) 색상 → 어떤 신상품에 있는지 역매핑
-        color_to_items = {
-            "ivory": ["Soft Blouse"],
-            "mist blue": ["Soft Blouse"],
-            "rose beige": ["Soft Blouse"],
-            "black": ["Soft Blouse", "Tailored Pants"],
-            "oatmeal": ["City Knit"],
-            "charcoal": ["City Knit"],
-            "forest": ["City Knit"],
-            "pink": ["City Knit"],
-            "sand": ["Everyday Jacket"],
-            "navy": ["Everyday Jacket", "Tailored Pants"],
-            "olive": ["Everyday Jacket"],
-            "greige": ["Tailored Pants"],
-            "berry": ["Weekend Dress"],
-            "ink": ["Weekend Dress"],
-            "cream": ["Weekend Dress"],
-        }
-
-        # 4) 사용자가 카테고리를 말한 경우 → 해당 아이템만 요약 (반복 방지)
-        if prod_key in summaries:
+        if stage == "fit_collect":
+            # Let LLM handle nuanced sizing advice grounded in docs, using the user's message + slots
             flow["stage"] = "end_or_more"
-            base = summaries[prod_key]
-            # 색/사이즈까지 이미 있으면 가용성 체크로 전환 제안
-            if color or size:
-                pick = f"{prod_key}"
-                if color: pick += f" in {color}"
-                if size:  pick += f" / {size}"
-                reply = f"{base} Want me to check availability for **{pick}**? I can switch to **Check product availability**."
-                return maybe_dedupe_reply(reply)
-            # 색/사이즈 없으면 자연스러운 좁히기
-            reply = f"{base} Would you like me to narrow by **color** or **size** next?"
-            return maybe_dedupe_reply(reply)
-
-        # 5) 색상만 말한 경우 → 그 색상이 포함된 신상품 나열
-        if color and color in color_to_items:
-            flow["stage"] = "end_or_more"
-            items = ", ".join(color_to_items[color])
-            reply = (
-                f"In this drop, **{color}** appears in: {items}. "
-                "Which one should I focus on, and do you have a size in mind?"
+            return answer_with_rag(
+                user_text,
+                retrieval_hint="size fit guidance runs small runs large true to size recommendations"
             )
-            return maybe_dedupe_reply(reply)
 
-        # 6) 스타일/용도 신호(너무 특정하지 않게 폭넓게) → 컬렉션 내 2~3개로 제안
-        if _any([r"\bcasual\b", r"\boffice\b", r"\bwork\b", r"\btravel\b", r"\bweekend\b",
-                 r"\bparty\b", r"\bevent\b", r"\bholiday\b"], low):
-            flow["stage"] = "end_or_more"
-            # 너무 구체적 한 가지가 아니라, 컬렉션 품목으로 폭넓게 안내
-            reply = (
-                "From the new collection, versatile picks are **City Knit** for layering, "
-                "**Everyday Jacket** on top, and **Tailored Pants** for balance. "
-                "Prefer me to tailor by category or color?"
-            )
-            return maybe_dedupe_reply(reply)
-
-        # 7) 티셔츠/신발 등 컬렉션 외 카테고리 언급 → 사실 전달 + 코어 카탈로그로 유도
-        if prod_key in ("tshirt", "shoes", "shoe", "sneakers"):
-            flow["stage"] = "end_or_more"
-            reply = (
-                "This seasonal drop highlights Soft Blouse, City Knit, Everyday Jacket, Tailored Pants, and Weekend Dress. "
-                "If you’d like **core** tees/shoes instead, I can switch to **Check product availability** and search the main catalog."
-            )
-            return maybe_dedupe_reply(reply)
-
-        # 8) 그 밖의 'new arrivals/collection' 같은 일반 질문 → 전체 요약 1회 + 좁히기
-        if _any([r"\bnew\b", r"\barrivals?\b", r"\bcollection\b", r"\bfall\b", r"\bautumn\b", r"\bwinter\b"], low):
-            flow["stage"] = "end_or_more"
-            reply = (
-                "Soft Blouse (Ivory/Mist Blue/Rose Beige/Black). City Knit (Oatmeal/Charcoal/Forest/Pink). "
-                "Everyday Jacket (Sand/Navy/Olive). Tailored Pants (Black/Greige/Navy). Weekend Dress (Berry/Ink/Cream). "
-                "Tell me a **category** or **color**, or give me **color/size** and I can switch to availability lookup."
-            )
-            return maybe_dedupe_reply(reply)
-
-        # 9) 색/사이즈만 주는 등 → 가용성 체크로 바로 유도
-        if (color or size):
-            flow["stage"] = "end_or_more"
-            ask = "color" if (color and not size) else "size" if (size and not color) else "category"
-            reply = (
-                f"I can check real-time stock. Tell me the **category** and {ask} to switch to **Check product availability**."
-            )
-            return maybe_dedupe_reply(reply)
-
-        # 10) 폴백: 사용자에게 간단히 선택 유도
-        return "From the new collection, which category should we start with—blouse, knit/sweater, jacket, pants, or dress?"
-
+        if stage == "end_or_more":
+            return "Happy to help. Anything else I can assist you with?"
+        return None
 
     # ---- Shipping & returns ----
     if current_scenario == "Shipping & returns":
-        # Shipping question detection — prioritized over return flow
+        # shipping question detection prioritized
         if _is_shipping_query(user_text):
             flow["stage"] = "end_or_more"
-            return (
-                "**Shipping overview:**\n"
-                "- Processing: usually 1 business day\n"
-                "- Standard (domestic): about 3–5 business days\n"
-                "- Express (domestic): about 1–2 business days\n"
-                "- International: typically 7–14 business days"
+            return answer_with_rag(
+                user_text,
+                retrieval_hint="shipping delivery processing time standard express international tracking eta"
             )
 
-        # Return flow
+        # Return flow (keep structure, but generate policy/instructions via RAG)
         if stage in (None, "start"):
             flow["stage"] = "returns_collect_item"
             return "Of course! I can help with a return. What item would you like to return?"
@@ -932,10 +826,8 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
             m = re.search(r"\b(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})\b", user_text)
             flow["slots"]["received_date"] = m.group(1) if m else "unknown"
             flow["stage"] = "returns_condition_check"
-            return (
-                "Thanks. For returns, items must be unworn and in original condition. "
-                "Can you confirm the item is unworn and in its original condition? (yes/no)"
-            )
+            # Ask condition check; policy details should come from RAG when needed
+            return "Thanks. Can you confirm the item is unworn and in original condition? (yes/no)"
 
         if stage == "returns_condition_check":
             if YES_PAT.search(user_text):
@@ -943,9 +835,9 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
                 return "Understood. Could you tell me the reason for the return? (e.g., too small, defective, changed mind)"
             if NO_PAT.search(user_text):
                 flow["stage"] = "end_or_more"
-                return (
-                    "Unfortunately, we can only accept returns that are unworn and in original condition. "
-                    "If you’d like, I can share our exchange or repair options."
+                return answer_with_rag(
+                    "Explain return eligibility requirements and alternatives (exchange/repair) based on policy.",
+                    retrieval_hint="returns eligibility unworn original condition exchange repair options"
                 )
             return "Please reply yes or no: is the item unworn and in original condition?"
 
@@ -953,19 +845,21 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
             flow["slots"]["return_reason"] = user_text.strip()
             flow["stage"] = "returns_instructions"
             item = flow["slots"].get("return_item", "the item")
-            return (
-                f"Thanks. To start your return for **{item}**, please follow these steps:\n"
-                "1) I’ll send a prepaid return label via email.\n"
-                "2) Pack the item securely with all tags/accessories.\n"
-                "3) Drop it off within **14 days** of delivery.\n"
-                "Once received and inspected, your refund will be processed to the original payment method.\n"
-                "Would you like me to email the return label to you now? (yes/no)"
+            received = flow["slots"].get("received_date", "unknown")
+            reason = flow["slots"].get("return_reason", "not specified")
+
+            # Generate instructions via RAG (avoid hardcoding windows/fees)
+            q = (
+                f"Create return instructions for {item}. Received date: {received}. Reason: {reason}. "
+                f"Include the correct return window, label process, and refund timing based on policy. "
+                f"End by asking if the user wants the return label emailed now (yes/no)."
             )
+            return answer_with_rag(q, retrieval_hint="returns steps label prepaid refund timing return window")
 
         if stage == "returns_instructions":
             if YES_PAT.search(user_text):
                 flow["stage"] = "end_or_more"
-                return "Great—return label request submitted! You’ll receive it shortly. Anything else I can help with?"
+                return "Great—your return label request is noted. You’ll receive it shortly. Anything else I can help with?"
             if NO_PAT.search(user_text):
                 flow["stage"] = "end_or_more"
                 return "No problem. If you need the label later, just ask. Anything else I can help with?"
@@ -975,121 +869,50 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
             return "Happy to help. Anything else I can assist you with?"
         return None
 
-    # ---- Discounts & promotions ----
-    if current_scenario == "Discounts & promotions":
+    # ---- Other ----
+    if current_scenario in ("Other", None, ""):
+        # Use RAG + natural LLM for broad questions
         flow["stage"] = "end_or_more"
-        return (
-            "Current promotions: sitewide **10%** (code **WELCOME10**), plus new-member **+5%** on the first order. "
-            "Order of operations: subtotal → % coupons → points → tax & shipping. "
-            "Some items may be excluded (FINAL_SALE, GIFT_CARD, MTO_EXCLUDED)."
-        )
+        return answer_with_rag(user_text, retrieval_hint="general help catalog policies")
 
-    # ---- Size & fit guidance ----
-    if current_scenario == "Size & fit guidance":
-        if _is_size_chart_query(user_text):
-            if stage in (None, "start"):
-                flow["stage"] = "fit_collect"
-            return "You can view our size guide on each product page under **Size & Fit**."
-
-        if stage in (None, "start"):
-            flow["stage"] = "fit_collect"
-            return "Sure—tell me your current size and how it fits."
-
-        if stage == "fit_collect":
-            too_small = re.search(r"\b(too\s*small|tight|snug)\b", user_text, re.I)
-            too_big = re.search(r"\b(too\s*big|loose)\b", user_text, re.I)
-            num = re.search(r"\b(\d{2}(\.\d)?|\d{1,2}(\.\d)?)\b", user_text)
-            letter = re.search(r"\b(XXS|XS|S|M|L|XL|XXL)\b", user_text, re.I)
-
-            if num:
-                base = num.group(1)
-                try:
-                    val = float(base)
-                except Exception:
-                    val = None
-
-                if val is not None and (too_small or too_big):
-                    rec = max(0, val - 1 if too_big else val + 1)
-                    flow["stage"] = "end_or_more"
-                    return (
-                        f"Since **{base}** feels {'small' if too_small else 'big'}, try **{rec:.1f}**. "
-                        "Want me to check availability in that size?"
-                    )
-                if val is not None and not (too_small or too_big):
-                    return "Thanks. How does that size fit—**too small, too big, or just right**?"
-
-            if letter:
-                L = letter.group(1).upper()
-                if too_small or too_big:
-                    nxt_up = {"XXS": "XS", "XS": "S", "S": "M", "M": "L", "L": "XL", "XL": "XXL"}
-                    nxt_down = {"XXL": "XL", "XL": "L", "L": "M", "M": "S", "S": "XS", "XS": "XXS"}
-                    rec = nxt_up.get(L) if too_small else nxt_down.get(L)
-                    flow["stage"] = "end_or_more"
-                    if rec:
-                        return (
-                            f"Since **{L}** feels {'small' if too_small else 'big'}, try **{rec}**. "
-                            "Want me to check availability in that size?"
-                        )
-                    return "You may need to adjust one size. Want me to check availability?"
-                return f"Got it. How does **{L}** fit—**too small, too big, or just right**?"
-
-            return "To recommend a size, tell me what you usually wear and whether it feels **too small, too big, or just right**."
-
-        if stage == "end_or_more":
-            return "Happy to help. Anything else I can assist you with?"
-        return None
-
-    # No matching rule — fallback to LLM/RAG
     return None
 
 
 # =========================
 # Global intent detection (cross-scenario)
 # =========================
-
 GLOBAL_INTENTS = [
-    # New arrivals / collections (cover fall/autumn phrasing too)
     (r"\b(new\s+arrivals?|latest\s+(drop|collection|release)s?|new\s+collection|this\s+(winter|fall|autumn|spring|summer)|"
      r"(winter|fall|autumn)\s+(arrivals?|collection))\b",
      "new_arrivals_intent", "New arrivals & collections", 10, True),
 
-    # Size chart / guide
     (r"\b(size\s*(chart|guide)|sizing\s*(chart|guide)?|size\s*info|size\s*measurement(s)?)\b",
      "size_chart_intent", "Size & fit guidance", 9, True),
 
-    # Free returns (generic, doesn’t hijack shipping)
     (r"\b(free\s+return(s)?(\s+shipping)?|return\s+shipping\s+covered)\b",
      "free_returns_intent", "Shipping & returns", 10, True),
 
-    # Shipping (keep generic; free-returns has equal/higher prio so it wins)
     (r"\b(ship|shipping|deliver(y|ed|ing)?|eta|track(ing)?|when\s+will\s+it\s+(arrive|be\s+delivered)|how\s+long.*(deliver|shipping|arrive))\b",
      "shipping_intent", "Shipping & returns", 9, True),
 
-    # Returns/exchange generic 
     (r"\b(return\s+policy|refund\s+policy|return\s+window|return|refund|send back|exchange)\b",
      "returns_intent", "Shipping & returns", 8, True),
 
-    # Availability
     (r"\b(availability|in stock|stock|have .* size|colors?|sizes?(?!\s*(chart|guide)))\b",
      "availability_intent", "Check product availability", 7, True),
 
-    # Rewards
     (r"\b(reward|point|redeem|earn|membership|tier)\b",
      "rewards_intent", "Rewards & membership", 6, True),
 
-    # Promotions / deals / discounts (new)
     (r"\b(deals?|discounts?|promotions?|sale|promo code|coupon)\b",
      "promotions_intent", "Discounts & promotions", 8, True),
 
-    # Price / range (new)
     (r"\b(price|price\s*range|how much|cost)\b",
      "price_intent", "Check product availability", 7, True),
 
-    # Men’s catalog (new)
     (r"\b(mens|men’s|for\s+a\s+man|male)\b",
      "mens_catalog_intent", "Other", 7, True),
 ]
-
 
 def detect_global_intent(user_text: str):
     text = (user_text or "").lower()
@@ -1102,26 +925,13 @@ def detect_global_intent(user_text: str):
 
 
 # =========================
-# Inline answer functions
+# Inline answer functions (UPDATED: use RAG instead of hardcoding)
 # =========================
-
 def inline_answer_shipping(user_text: str) -> str:
-    # 간단한 배송 개요만 제공 (추가 질문 없음)
-    return (
-        "**Shipping overview**\n"
-        "- Processing: usually 1 business day\n"
-        "- Standard (domestic): about 3–5 business days\n"
-        "- Express (domestic): about 1–2 business days\n"
-        "- International: typically 7–14 business days"
-    )
+    return answer_with_rag(user_text, retrieval_hint="shipping delivery processing standard express international tracking eta")
 
 def inline_answer_return_policy(user_text: str) -> str:
-    # free_returns_policy + shipping_returns 요지를 2–3문장으로 요약
-    return (
-        "Returns are accepted within **14 days** of delivery, and items must be **unworn** and in original condition. "
-        "Return **shipping is covered** for defective or wrong-item cases; for fit/changed-mind, coverage can vary by policy or promotion. "
-        "Refunds are typically processed **3–5 business days** after the carrier scans the return."
-    )
+    return answer_with_rag(user_text, retrieval_hint="returns policy return window eligibility refund timing return shipping covered")
 
 def inline_answer_availability(user_text: str) -> str:
     _update_slots_from_text(user_text)
@@ -1129,124 +939,44 @@ def inline_answer_availability(user_text: str) -> str:
     p = slots.get("product") or "item"
     c = slots.get("color")
     s = slots.get("size")
-    base = f"For the {p}"
+    q = f"User asks about availability for {p}"
     if c:
-        base += f" in {c}"
+        q += f" in {c}"
     if s:
-        base += f" / {s}"
-    return (
-        f"{base}, I can check availability in detail if you like. "
-        f"Would you like to **switch to Check product availability**?"
-    )
-
+        q += f" size {s}"
+    q += ". Explain how to check stock and what details you need."
+    return answer_with_rag(q, retrieval_hint="availability in stock colors sizes inventory how to check")
 
 def inline_answer_fit(user_text: str) -> str:
-    mnum = re.search(r"\b(\d{2}(\.\d)?|\d{1,2}(\.\d)?)\b", user_text)
-    if mnum:
-        base = float(mnum.group(1))
-        rec = base + 1 if base >= 20 else base + 0.5
-        return (
-            f"If **{base:.1f}** feels small, try **{rec:.1f}**. "
-            "Want to **switch to Size & fit guidance** for a precise recommendation?"
-        )
-    return "I can help with sizing. Want to **switch to Size & fit guidance**?"
-
+    return answer_with_rag(user_text, retrieval_hint="size fit guidance true to size runs small runs large")
 
 def inline_answer_rewards(user_text: str) -> str:
-    return (
-        "Every 100 pts = $1 off (merchandise subtotal only). "
-        "Tiers are rolling 12 months; points expire after 12 months of no activity. "
-        "Want to **switch to Rewards & membership** to see earning/redeem tips?"
-    )
-
+    return answer_with_rag(user_text, retrieval_hint="rewards membership points tiers redeem expiration")
 
 def inline_answer_size_chart(user_text: str) -> str:
-    # 간단한 사이즈 표 제공 (Top / Bottom 공용)
-    return (
-        "Here’s our general **Size Guide** (inches):\n\n"
-        "| Size | Bust | Waist | Hip |\n"
-        "|:------:|:------:|:------:|:------:|\n"
-        "| XXS | 30–31 | 23–24 | 33–34 |\n"
-        "| XS  | 32–33 | 25–26 | 35–36 |\n"
-        "| S   | 34–35 | 27–28 | 37–38 |\n"
-        "| M   | 36–37 | 29–30 | 39–40 |\n"
-        "| L   | 38.5–40 | 31.5–33 | 41.5–43 |\n"
-        "| XL  | 41.5–43 | 34.5–36 | 44.5–46 |\n"
-        "| XXL | 44.5–46 | 37.5–39 | 47.5–49 |\n\n"
-    )
+    return answer_with_rag(user_text, retrieval_hint="size chart size guide measurements bust waist hip")
 
 def inline_answer_new_arrivals(user_text: str) -> str:
-    # short, prose-friendly handoff to the collection
-    return ("Our new collection is live. Tell me a category or color and I’ll tailor picks. "
-            "Reply **yes** to switch to **New arrivals & collections**.")
+    return answer_with_rag(user_text, retrieval_hint="new arrivals collection lineup items colors categories")
 
 def inline_answer_promotions(user_text: str) -> str:
-    # mirrors your promotions_rules Short Answer Template
-    return ("You can apply % coupons to the merchandise subtotal (e.g., WELCOME10). "
-            "New members get an extra +5% on their first order and it stacks. "
-            "Some items may be excluded (FINAL_SALE, GIFT_CARD, MTO_EXCLUDED).")
+    return answer_with_rag(user_text, retrieval_hint="promotions discounts coupon codes exclusions stacking")
 
 def inline_answer_price(user_text: str) -> str:
-    _update_slots_from_text(user_text)
-    return ("Prices vary by fabric and construction. If you tell me a product/color/size, "
-            "I’ll pull the current price. Typical ranges: tees $18–$32, shirts $35–$79, "
-            "knitwear $55–$129, pants $59–$119, jackets $89–$189, dresses $69–$149.")
+    return answer_with_rag(user_text, retrieval_hint="pricing price range typical ranges by category")
 
 def inline_answer_mens_catalog(user_text: str) -> str:
-    # stops “we only sell women’s” errors and guides to category
-    return ("We offer apparel for men and women. For men, common categories include shirts, pants, "
-            "jackets, knitwear, and sleepwear. Which category would you like?")
+    return answer_with_rag(user_text, retrieval_hint="mens catalog men and women categories shirts pants jackets knitwear")
 
 def inline_answer_free_returns(user_text: str) -> str:
-    return (
-        "Return shipping is covered for defective or wrong-item cases. "
-        "For other reasons, coverage may vary by policy or promotion. "
-        "Would you like to switch to **Shipping & returns** for the steps?"
-    )
-
-
-# =========================
-# Emoji / tone post-processor
-# =========================
-# Matches most common Unicode emoji ranges
-_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]+")
-
-def apply_tone_policies(text: str) -> str:
-    """
-    Tone policy:
-    - formal: remove all emojis
-    - informal: keep at most one emoji and move it to the very end
-    """
-    if not isinstance(text, str) or not text:
-        return text
-
-    # formal: no emojis at all
-    if TONE == "formal":
-        return _EMOJI_RE.sub("", text)
-
-    # informal: allow at most one emoji
-    emojis = list(_EMOJI_RE.finditer(text))
-    if not emojis:
-        return text
-
-    # keep only the first emoji
-    first_emoji = emojis[0].group(0)
-    # remove all emojis from the text
-    cleaned = _EMOJI_RE.sub("", text).rstrip()
-
-    # append one emoji at the very end
-    if cleaned and cleaned[-1] in ".!?":
-        return f"{cleaned} {first_emoji}"
-    return f"{cleaned} {first_emoji}"
+    return answer_with_rag(user_text, retrieval_hint="free returns return shipping covered exceptions")
 
 
 # =========================
 # Inline handler mapping
 # =========================
-
 INLINE_HANDLERS = {
     "availability_intent": inline_answer_availability,
-    "fit_intent":          inline_answer_fit,
     "rewards_intent":      inline_answer_rewards,
     "size_chart_intent":   inline_answer_size_chart,
     "shipping_intent":     inline_answer_shipping,
@@ -1254,9 +984,9 @@ INLINE_HANDLERS = {
     "promotions_intent":   inline_answer_promotions,
     "price_intent":        inline_answer_price,
     "mens_catalog_intent": inline_answer_mens_catalog,
-    "returns_intent":      inline_answer_return_policy, 
+    "returns_intent":      inline_answer_return_policy,
+    "free_returns_intent": inline_answer_free_returns,
 }
-
 
 
 # =========================
@@ -1268,22 +998,21 @@ def handle_message(user_text: str) -> str:
     if pending_reply:
         return maybe_add_one_time_closing(apply_tone_policies(pending_reply))
 
-    # 2) Global intent detection and (if needed) inline suggestion / switch prompt
+    # 2) Global intent detection and inline
     detected = detect_global_intent(user_text)
     if detected:
         current = st.session_state.flow.get("scenario")
         target  = detected["target"]
 
-        # ⭐ 동일 시나리오여도 인라인 응답이 가능하면 '바로' 답변 (switch 확인 없이)
         if detected["can_inline"]:
             inline_fun = INLINE_HANDLERS.get(detected["key"])
             if inline_fun:
-                # 같은 시나리오면 바로 인라인 답변
+                # same scenario -> answer directly
                 if current == target:
                     reply = inline_fun(user_text)
                     return maybe_add_one_time_closing(apply_tone_policies(reply))
 
-        # 시나리오가 다르면, 인라인 미사용 시 스위치 제안
+        # scenario switch suggestion when different
         if current != target:
             if detected["can_inline"]:
                 inline_fun = INLINE_HANDLERS.get(detected["key"])
@@ -1295,14 +1024,14 @@ def handle_message(user_text: str) -> str:
             set_pending("confirm_switch", {"target": target})
             return maybe_add_one_time_closing(apply_tone_policies(msg))
 
-    # 3) Scenario-specific rule routing
+    # 3) Scenario-specific routing
     current_scenario = st.session_state.flow.get("scenario")
     rule_reply = route_by_scenario(current_scenario, user_text)
     if rule_reply is not None:
         infer_pending_from_bot_reply(rule_reply)
         return maybe_add_one_time_closing(apply_tone_policies(rule_reply))
 
-    # 4) LLM/RAG fallback
+    # 4) LLM fallback
     bot_reply = llm_fallback(user_text)
     infer_pending_from_bot_reply(bot_reply)
     return maybe_add_one_time_closing(apply_tone_policies(bot_reply))
@@ -1311,13 +1040,11 @@ def handle_message(user_text: str) -> str:
 # =========================
 # UI — 전체(인사/채팅 → 시나리오 → 입력/진행/종료/만족도) + 즉시 표시
 # =========================
-
-# 화면 상단에 렌더링될 영역(고정 순서용 컨테이너) 먼저 배치
-chat_area = st.container()       # 최상단: 채팅(인사 포함)
+chat_area = st.container()
 st.markdown("---")
-scenario_area = st.container()   # 중간: 시나리오 드롭다운
+scenario_area = st.container()
 st.markdown("---")
-control_area = st.container()    # 하단: 입력/진행/종료(또는 만족도)
+control_area = st.container()
 
 # -------------------------
 # (중간) 시나리오 드롭다운 — 선택 처리
@@ -1336,7 +1063,6 @@ with scenario_area:
         "Other",
     ]
 
-    # ✅ 접근성 경고 해결: 빈 레이블("") 대신 의미 있는 레이블을 주고 화면에서는 숨김
     scenario = st.selectbox(
         "Select a scenario",
         SCENARIOS,
@@ -1351,7 +1077,6 @@ with scenario_area:
             "If 'Other', briefly describe your goal (optional)"
         )
 
-    # 선택 변경 감지 → 플로우 초기화 + Skyler 안내를 즉시 채팅에 추가
     if (
         scenario != "— Select a scenario —"
         and st.session_state.last_user_selected_scenario != scenario
@@ -1377,16 +1102,13 @@ with scenario_area:
 with control_area:
     scenario_selected = (st.session_state.flow.get("scenario") is not None)
 
-    # 1) 대화 단계
     if not st.session_state.awaiting_feedback and not st.session_state.ended:
-        # 시나리오가 선택되어야 입력 허용
         if scenario_selected:
             with st.form("chat_form", clear_on_submit=True):
                 user_input = st.text_input("Your message:")
                 submitted = st.form_submit_button("Send")
 
             if submitted and user_input.strip():
-                # 즉시 메모리 반영 → 같은 사이클에서 바로 보이도록
                 st.session_state.user_turns += 1
                 st.session_state.chat_history.append(("User", user_input.strip()))
                 bot_reply = handle_message(user_input.strip())
@@ -1395,7 +1117,6 @@ with control_area:
         else:
             st.info("Please choose a topic above to start chatting.")
 
-        # 진행 안내(문구 유지)
         if st.session_state.user_turns < MIN_USER_TURNS:
             remaining = MIN_USER_TURNS - st.session_state.user_turns
             st.info(
@@ -1404,7 +1125,6 @@ with control_area:
             )
         st.progress(min(st.session_state.user_turns / MIN_USER_TURNS, 1.0))
 
-        # End Session (5턴 전 회색 비활성 유지)
         st.markdown("---")
         can_end = (st.session_state.user_turns >= MIN_USER_TURNS)
         help_text = None if can_end else f"Please send at least {MIN_USER_TURNS - st.session_state.user_turns} more message(s) before ending."
@@ -1412,7 +1132,6 @@ with control_area:
             st.session_state.awaiting_feedback = True
             st.rerun()
 
-    # 2) 만족도 수집 단계
     else:
         if st.session_state.awaiting_feedback and not st.session_state.ended:
             st.subheader("Before you go…")
@@ -1420,7 +1139,6 @@ with control_area:
             st.caption("1 = Very dissatisfied, 7 = Very satisfied")
             rating = st.slider("Your overall satisfaction", min_value=1, max_value=7, value=5, step=1)
 
-            # 🔹 Prolific ID 입력 (선택 사항)
             prolific_id = st.text_input(
                 "Please provide your Prolific ID (write N/A if none) — only to check the submission completion.",
                 value=""
@@ -1428,10 +1146,8 @@ with control_area:
 
             if st.button("Submit Rating"):
                 ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-                # 시나리오 문자열
                 scenostr = st.session_state.flow.get("scenario") or "— Select a scenario —"
 
-                # 전사 구성 (Prolific ID 포함)
                 transcript_lines = []
                 transcript_lines.append("===== Session Transcript =====")
                 transcript_lines.append(f"timestamp       : {ts}")
@@ -1450,16 +1166,13 @@ with control_area:
                 transcript_lines.append(f"Satisfaction (1-7): {rating}")
                 transcript_text = "\n".join(transcript_lines)
 
-                # 저장
                 try:
-                    # 1) transcript 저장
                     supabase.table("transcripts").insert({
                         "session_id": st.session_state.session_id,
                         "ts": datetime.datetime.utcnow().isoformat() + "Z",
                         "transcript_text": transcript_text,
                     }).execute()
-                
-                    # 2) session 정보 upsert (중복 insert 방지)
+
                     supabase.table("sessions").upsert(
                         {
                             "session_id": st.session_state.session_id,
@@ -1467,15 +1180,15 @@ with control_area:
                             "ts_end": datetime.datetime.utcnow().isoformat() + "Z",
                             "identity_option": identity_option,
                             "brand_type": brand_type,
-                            "name_present": "present",
-                            "picture_present": "present",
+                            "name_present": "present" if show_name else "absent",
+                            "picture_present": "present" if show_picture else "absent",
                             "scenario": scenostr,
                             "user_turns": st.session_state.user_turns,
                             "bot_turns": st.session_state.bot_turns,
                         },
                         on_conflict="session_id"
                     ).execute()
-                
+
                 except Exception as e:
                     st.error(f"Failed to save to Supabase: {e}")
                 else:
@@ -1511,3 +1224,4 @@ with chat_area:
                 """,
                 unsafe_allow_html=True
             )
+
