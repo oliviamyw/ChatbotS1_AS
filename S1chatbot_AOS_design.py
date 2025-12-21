@@ -781,10 +781,20 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
 
     # ---- Size & fit guidance ----
     if current_scenario == "Size & fit guidance":
-        if _is_size_chart_query(user_text):
+        # 0) "What size do you offer?" 같은 질문도 사이즈표로 처리되도록 확장
+        #    (기존 _is_size_chart_query가 약하면 여기서 한 번 더 잡아줌)
+        size_offer_q = re.search(
+            r"\b(what\s+sizes?\s+do\s+you\s+(have|offer)|available\s+sizes?|size\s+range)\b",
+            user_text or "",
+            re.I
+        )
+    
+        # 1) 사이즈표/사이즈가이드 요청이면: RAG 우선 → 없으면 인라인 표
+        if _is_size_chart_query(user_text) or size_offer_q:
             flow["stage"] = "fit_collect"
     
-            rag_query = make_query(user_text + " size guide size chart measurements bust waist hip inseam fit")
+            # RAG에서 size guide 관련 문서 검색
+            rag_query = make_query((user_text or "") + " size guide size chart measurements bust waist hip inseam fit")
             rag_ctx = retrieve_context(rag_query, k=6)
     
             if rag_ctx and rag_ctx.strip():
@@ -792,9 +802,9 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
     You are a helpful customer service chatbot for Style Loom.
     Use ONLY the BUSINESS CONTEXT to answer.
     
-    - If the context contains a size guide/chart, present it clearly (table or bullet ranges).
-    - If the context mentions where it appears on the product page, include that.
-    - If the context does NOT include a size guide, say so and ask ONE concise follow-up question.
+    - If the context contains a size guide/chart, present it clearly (compact markdown table or bullet ranges).
+    - If it mentions where it appears on the product page, include that.
+    - If the context does NOT include a size chart, say so and ask ONE concise follow-up question.
     
     === BUSINESS CONTEXT ===
     {rag_ctx}
@@ -804,44 +814,70 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
     Chatbot:
     """.strip()
     
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                )
-                return resp.choices[0].message.content
+                try:
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                    )
+                    return resp.choices[0].message.content
+                except Exception as e:
+                    st.warning(f"LLM call failed (size chart RAG): {e}")
+                    return inline_answer_size_chart(user_text)
     
-            # RAG에서 못 찾으면 인라인 표로 폴백
             return inline_answer_size_chart(user_text)
-
-        # 1) 일반적인 fit 상담 플로우는 기존 그대로 유지
+    
+        # 2) 일반 fit 상담 시작
         if stage in (None, "start"):
             flow["stage"] = "fit_collect"
-            return "Sure—tell me your current size and how it fits."
+            return "Sure—what item are you shopping for (e.g., dress, tops, pants), and what size do you usually wear?"
     
+        # 3) fit_collect: 사용자가 준 정보로 추천
         if stage == "fit_collect":
-            too_small = re.search(r"\b(too\s*small|tight|snug)\b", user_text, re.I)
-            too_big = re.search(r"\b(too\s*big|loose)\b", user_text, re.I)
-            num = re.search(r"\b(\d{2}(\.\d)?|\d{1,2}(\.\d)?)\b", user_text)
-            letter = re.search(r"\b(XXS|XS|S|M|L|XL|XXL)\b", user_text, re.I)
+            text = user_text or ""
     
-            if num:
-                base = num.group(1)
+            # ✅ NEW: "just right" 처리 (루프 방지)
+            just_right = re.search(r"\b(just\s*right|fits?\s*well|perfect)\b", text, re.I)
+            too_small  = re.search(r"\b(too\s*small|tight|snug)\b", text, re.I)
+            too_big    = re.search(r"\b(too\s*big|loose)\b", text, re.I)
+    
+            # 사이즈 추출(문장 안에 같이 들어오면 바로 추천)
+            letter = re.search(r"\b(XXS|XS|S|M|L|XL|XXL)\b", text, re.I)
+            num    = re.search(r"\b(0|2|4|6|8|10|12|14|16|18)\b", text)
+    
+            if just_right and (letter or num):
+                chosen = (letter.group(1).upper() if letter else num.group(1))
+                flow["stage"] = "end_or_more"
+                return (
+                    f"If **{chosen}** usually feels just right, start with **{chosen}**. "
+                    "If you’re between sizes, size up for woven/non-stretch and size down for knit/stretch. "
+                    "Would you like the full **Size Chart** table?"
+                )
+    
+            # "just right"만 있고 사이즈 정보가 없으면 → 사이즈를 먼저 물어봄
+            if just_right and not (letter or num):
+                return "Got it. What size do you usually wear (e.g., **S/M/L** or **4/6/8**)?"
+    
+            # 기존 로직(숫자 사이즈 기반 업/다운)
+            mnum_any = re.search(r"\b(\d{2}(\.\d)?|\d{1,2}(\.\d)?)\b", text)
+            if mnum_any:
+                base = mnum_any.group(1)
                 try:
                     val = float(base)
                 except Exception:
                     val = None
     
                 if val is not None and (too_small or too_big):
-                    rec = max(0, val - 1 if too_big else val + 1)
+                    rec = (val + 1) if too_small else (val - 1)
                     flow["stage"] = "end_or_more"
                     return (
                         f"Since **{base}** feels {'small' if too_small else 'big'}, try **{rec:.1f}**. "
                         "Want me to check availability in that size?"
                     )
                 if val is not None and not (too_small or too_big):
-                    return "Thanks. How does that size fit—**too small, too big, or just right**?"
+                    return "Thanks. Does that size feel **too small, too big, or just right**?"
     
+            # 기존 로직(문자 사이즈 기반 업/다운)
             if letter:
                 L = letter.group(1).upper()
                 if too_small or too_big:
@@ -857,10 +893,12 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
                     return "You may need to adjust one size. Want me to check availability?"
                 return f"Got it. How does **{L}** fit—**too small, too big, or just right**?"
     
-            return "To recommend a size, tell me what you usually wear and whether it feels **too small, too big, or just right**."
+            # 아무 정보도 충분치 않으면: 한 번만 더 구체적으로 질문
+            return "To recommend a size, tell me what you usually wear (e.g., **S/M/L** or **4/6/8**) and whether it feels **too small, too big, or just right**."
     
         if stage == "end_or_more":
             return "Happy to help. Anything else I can assist you with?"
+    
         return None
 
 
@@ -949,7 +987,8 @@ GLOBAL_INTENTS = [
      r"(winter|fall|autumn)\s+(arrivals?|collection))\b",
      "new_arrivals_intent", "New arrivals & collections", 10, True),
 
-    (r"\b(size\s*(chart|guide)|sizing\s*(chart|guide)?|size\s*info|size\s*measurement(s)?)\b",
+    (r"\b(size\s*(chart|guide)|sizing\s*(chart|guide)?|size\s*info|size\s*measurement(s)?|"
+     r"size\s*range|available\s*sizes?|what\s*sizes?\s*do\s*you\s*(have|offer))\b",
      "size_chart_intent", "Size & fit guidance", 9, True),
 
     (r"\b(free\s+return(s)?(\s+shipping)?|return\s+shipping\s+covered)\b",
