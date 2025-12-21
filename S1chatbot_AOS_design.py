@@ -331,7 +331,7 @@ def maybe_add_one_time_closing(reply: str) -> str:
 # =========================
 # RAG: Build/Load Vectorstore
 # =========================
-RAG_DIR = str(Path.cwd() / "rag_docs")
+RAG_DIR = "/mnt/data"
 
 @st.cache_resource(show_spinner=False)
 def build_or_load_vectorstore(rag_dir: str):
@@ -781,21 +781,18 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
 
     # ---- Size & fit guidance ----
     if current_scenario == "Size & fit guidance":
-        # 0) 사이즈표/사이즈 범위 질문이면: RAG에서 먼저 끌어오고, 없으면 인라인 표
         if _is_size_chart_query(user_text):
             flow["stage"] = "fit_collect"
     
-            # RAG에서 size guide 관련 문서 검색
             rag_query = make_query(user_text + " size guide size chart measurements bust waist hip inseam fit")
             rag_ctx = retrieve_context(rag_query, k=6)
     
-            # 문서가 있으면: 그 문서만 근거로 답변 생성
             if rag_ctx and rag_ctx.strip():
                 prompt = f"""
     You are a helpful customer service chatbot for Style Loom.
     Use ONLY the BUSINESS CONTEXT to answer.
     
-    - If the context contains a size guide/chart, present it clearly (compact table or bullet ranges).
+    - If the context contains a size guide/chart, present it clearly (table or bullet ranges).
     - If the context mentions where it appears on the product page, include that.
     - If the context does NOT include a size guide, say so and ask ONE concise follow-up question.
     
@@ -807,20 +804,16 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
     Chatbot:
     """.strip()
     
-                try:
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.2,
-                    )
-                    return resp.choices[0].message.content
-                except Exception as e:
-                    st.warning(f"LLM call failed (size guide RAG): {e}")
-                    return inline_answer_size_chart(user_text)
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                )
+                return resp.choices[0].message.content
     
-            # 문서가 없으면: 인라인 표로 폴백
+            # RAG에서 못 찾으면 인라인 표로 폴백
             return inline_answer_size_chart(user_text)
-    
+
         # 1) 일반적인 fit 상담 플로우는 기존 그대로 유지
         if stage in (None, "start"):
             flow["stage"] = "fit_collect"
