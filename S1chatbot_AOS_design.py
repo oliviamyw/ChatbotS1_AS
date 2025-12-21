@@ -192,7 +192,11 @@ NO_PAT  = re.compile(r"\b(no|nope|nah|not now|later)\b", re.I)
 def _is_size_chart_query(t: str) -> bool:
     """Detects 'size chart/guide' style questions anywhere in the text."""
     return bool(re.search(
-        r"\b(size\s*(chart|guide)|sizing\s*(chart|guide)?|size\s*info|measurement(s)?)\b",
+        r"\b("
+        r"size\s*(chart|guide)|sizing\s*(chart|guide)?|size\s*info|measurement(s)?"
+        r"|size\s*range|available\s*sizes?|what\s*sizes?\s*do\s*you\s*offer"
+        r"|do\s*you\s*have\s*(xs|s|m|l|xl|xxl)|offer\s*sizes?"
+        r")\b",
         t or "", re.I
     ))
 
@@ -777,29 +781,95 @@ def route_by_scenario(current_scenario: str, user_text: str) -> str | None:
 
     # ---- Size & fit guidance ----
     if current_scenario == "Size & fit guidance":
+        # 0) 사이즈표/사이즈 범위 질문이면: RAG에서 먼저 끌어오고, 없으면 인라인 표
         if _is_size_chart_query(user_text):
-            flow["stage"] = "end_or_more"
-            # Pull size guide info from RAG docs rather than hardcoded chart
-            return answer_with_rag(
-                "Please provide the size guide/size chart information and where to find it on the product page.",
-                retrieval_hint="size guide size chart measurements bust waist hip inseam fit notes"
-            )
-
+            flow["stage"] = "fit_collect"
+    
+            # RAG에서 size guide 관련 문서 검색
+            rag_query = make_query(user_text + " size guide size chart measurements bust waist hip inseam fit")
+            rag_ctx = retrieve_context(rag_query, k=6)
+    
+            # 문서가 있으면: 그 문서만 근거로 답변 생성
+            if rag_ctx and rag_ctx.strip():
+                prompt = f"""
+    You are a helpful customer service chatbot for Style Loom.
+    Use ONLY the BUSINESS CONTEXT to answer.
+    
+    - If the context contains a size guide/chart, present it clearly (compact table or bullet ranges).
+    - If the context mentions where it appears on the product page, include that.
+    - If the context does NOT include a size guide, say so and ask ONE concise follow-up question.
+    
+    === BUSINESS CONTEXT ===
+    {rag_ctx}
+    === END CONTEXT ===
+    
+    User: {user_text}
+    Chatbot:
+    """.strip()
+    
+                try:
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                    )
+                    return resp.choices[0].message.content
+                except Exception as e:
+                    st.warning(f"LLM call failed (size guide RAG): {e}")
+                    return inline_answer_size_chart(user_text)
+    
+            # 문서가 없으면: 인라인 표로 폴백
+            return inline_answer_size_chart(user_text)
+    
+        # 1) 일반적인 fit 상담 플로우는 기존 그대로 유지
         if stage in (None, "start"):
             flow["stage"] = "fit_collect"
             return "Sure—tell me your current size and how it fits."
-
+    
         if stage == "fit_collect":
-            # Let LLM handle nuanced sizing advice grounded in docs, using the user's message + slots
-            flow["stage"] = "end_or_more"
-            return answer_with_rag(
-                user_text,
-                retrieval_hint="size fit guidance runs small runs large true to size recommendations"
-            )
-
+            too_small = re.search(r"\b(too\s*small|tight|snug)\b", user_text, re.I)
+            too_big = re.search(r"\b(too\s*big|loose)\b", user_text, re.I)
+            num = re.search(r"\b(\d{2}(\.\d)?|\d{1,2}(\.\d)?)\b", user_text)
+            letter = re.search(r"\b(XXS|XS|S|M|L|XL|XXL)\b", user_text, re.I)
+    
+            if num:
+                base = num.group(1)
+                try:
+                    val = float(base)
+                except Exception:
+                    val = None
+    
+                if val is not None and (too_small or too_big):
+                    rec = max(0, val - 1 if too_big else val + 1)
+                    flow["stage"] = "end_or_more"
+                    return (
+                        f"Since **{base}** feels {'small' if too_small else 'big'}, try **{rec:.1f}**. "
+                        "Want me to check availability in that size?"
+                    )
+                if val is not None and not (too_small or too_big):
+                    return "Thanks. How does that size fit—**too small, too big, or just right**?"
+    
+            if letter:
+                L = letter.group(1).upper()
+                if too_small or too_big:
+                    nxt_up = {"XXS": "XS", "XS": "S", "S": "M", "M": "L", "L": "XL", "XL": "XXL"}
+                    nxt_down = {"XXL": "XL", "XL": "L", "L": "M", "M": "S", "S": "XS", "XS": "XXS"}
+                    rec = nxt_up.get(L) if too_small else nxt_down.get(L)
+                    flow["stage"] = "end_or_more"
+                    if rec:
+                        return (
+                            f"Since **{L}** feels {'small' if too_small else 'big'}, try **{rec}**. "
+                            "Want me to check availability in that size?"
+                        )
+                    return "You may need to adjust one size. Want me to check availability?"
+                return f"Got it. How does **{L}** fit—**too small, too big, or just right**?"
+    
+            return "To recommend a size, tell me what you usually wear and whether it feels **too small, too big, or just right**."
+    
         if stage == "end_or_more":
             return "Happy to help. Anything else I can assist you with?"
         return None
+
 
     # ---- Shipping & returns ----
     if current_scenario == "Shipping & returns":
@@ -897,6 +967,10 @@ GLOBAL_INTENTS = [
 
     (r"\b(return\s+policy|refund\s+policy|return\s+window|return|refund|send back|exchange)\b",
      "returns_intent", "Shipping & returns", 8, True),
+
+    (r"\b(size\s*range|available\s*sizes?|what\s*sizes?\s*do\s*you\s*offer|offer\s*sizes?|"
+     r"do\s*you\s*have\s*(xxs|xs|s|m|l|xl|xxl))\b",
+     "size_range_intent", "Size & fit guidance", 9, True),
 
     (r"\b(availability|in stock|stock|have .* size|colors?|sizes?(?!\s*(chart|guide)))\b",
      "availability_intent", "Check product availability", 7, True),
