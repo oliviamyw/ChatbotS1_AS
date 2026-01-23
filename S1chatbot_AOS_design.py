@@ -6,9 +6,16 @@
 #   - Put knowledge files under: ./data/
 #   - Example: data/about.md, data/new_drop.md, data/size_chart.md, ...
 #
-# Secrets requirement:
+# Secrets requirement (Streamlit Secrets):
 #   - OPENAI_API_KEY
-#   - SUPABASE_URL, SUPABASE_ANON_KEY  (optional: set REQUIRE_SUPABASE=False to run without)
+#   - SUPABASE_URL
+#   - SUPABASE_ANON_KEY
+#
+# Storage policy:
+#   - Save ONLY when user ends chat and clicks "Submit rating and save"
+#   - Save transcript to "transcripts" table
+#   - Save session meta to "sessions" table
+#   - Save rating to separate "ratings" table
 # =========================
 
 import os
@@ -22,11 +29,7 @@ from typing import Optional, Dict, List, Tuple
 import streamlit as st
 from openai import OpenAI
 
-# Supabase (optional)
-try:
-    from supabase import create_client
-except Exception:
-    create_client = None
+from supabase import create_client  # Supabase is REQUIRED
 
 # LangChain / Vector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -40,11 +43,13 @@ from langchain_community.vectorstores import Chroma
 # -------------------------
 st.set_page_config(page_title="Style Loom Chatbot Experiment", layout="centered")
 
+
 # -------------------------
 # Paths
 # -------------------------
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+
 
 # -------------------------
 # Experiment constants
@@ -53,8 +58,11 @@ MODEL_CHAT = "gpt-4o-mini"
 MODEL_EMBED = "text-embedding-3-small"
 MIN_USER_TURNS = 5
 
-# If you want to run without Supabase, set False
-REQUIRE_SUPABASE = True
+# Supabase tables (change only if your table names differ)
+TBL_TRANSCRIPTS = "transcripts"
+TBL_SESSIONS = "sessions"
+TBL_RATINGS = "ratings"
+
 
 # -------------------------
 # OpenAI client
@@ -63,23 +71,26 @@ API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
 if not API_KEY:
     st.error("OPENAI_API_KEY is not set. Please configure it in environment variables or st.secrets.")
     st.stop()
+
 client = OpenAI(api_key=API_KEY)
 
-# -------------------------
-# Supabase client (optional)
-# -------------------------
-SUPA_URL = st.secrets.get("SUPABASE_URL")
-SUPA_KEY = st.secrets.get("SUPABASE_ANON_KEY")
 
-supabase = None
-if SUPA_URL and SUPA_KEY and create_client:
-    @st.cache_resource(show_spinner=False)
-    def get_supabase():
-        return create_client(SUPA_URL, SUPA_KEY)
-    supabase = get_supabase()
-elif REQUIRE_SUPABASE:
+# -------------------------
+# Supabase client (REQUIRED)
+# -------------------------
+SUPA_URL = st.secrets.get("SUPABASE_URL", None)
+SUPA_KEY = st.secrets.get("SUPABASE_ANON_KEY", None)
+
+if not SUPA_URL or not SUPA_KEY:
     st.error("Supabase credentials are missing. Please set SUPABASE_URL and SUPABASE_ANON_KEY in st.secrets.")
     st.stop()
+
+@st.cache_resource(show_spinner=False)
+def get_supabase():
+    return create_client(SUPA_URL, SUPA_KEY)
+
+supabase = get_supabase()
+
 
 # -------------------------
 # Session state
@@ -95,6 +106,7 @@ defaults = {
     "last_user_selected_scenario": "— Select a scenario —",
     "active_scenario": None,                 # scenario used to answer (can auto-switch)
     "switch_log": [],                        # list of dicts
+    "session_started_logged": False,          # ensure ts_start logged once
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -114,6 +126,10 @@ brand_type = "Start-up Brand"
 def chatbot_speaker() -> str:
     return CHATBOT_NAME if show_name else "Assistant"
 
+
+# -------------------------
+# Header UI
+# -------------------------
 st.markdown(
     "<div style='display:flex;align-items:center;gap:8px;margin:8px 0 4px 0;'>"
     "<div style='font-weight:700;font-size:20px;letter-spacing:0.3px;'>Style Loom</div>"
@@ -125,6 +141,7 @@ if show_picture:
         st.image(CHATBOT_PICTURE, width=84)
     except Exception:
         pass
+
 
 # -------------------------
 # Scenarios (dropdown)
@@ -141,7 +158,6 @@ SCENARIOS = [
     "Other",
 ]
 
-# Map scenario to intent key (internal)
 SCENARIO_TO_INTENT = {
     "Check product availability": "availability",
     "Shipping & returns": "shipping_returns",
@@ -154,7 +170,6 @@ SCENARIO_TO_INTENT = {
     "— Select a scenario —": "none",
 }
 
-# Map intent to knowledge files (optional)
 INTENT_TO_FILES = {
     "availability": [
         "availability_playbook.md",
@@ -203,25 +218,32 @@ def scenario_to_intent(scenario: Optional[str]) -> str:
 # -------------------------
 INTENT_KEYWORDS: Dict[str, List[str]] = {
     "new_arrivals": [
-        "new drop", "new arrivals", "new arrival", "new collection", "latest", "this season", "신상", "새로 나온", "신규",
+        "new drop", "new arrivals", "new arrival", "new collection", "latest", "this season",
+        "신상", "새로 나온", "신규", "이번 시즌",
     ],
     "size_fit": [
-        "size", "sizing", "fit", "measurement", "measurements", "bust", "waist", "hip", "xs", "xl", "cm", "inch", "사이즈", "핏",
+        "size", "sizing", "fit", "measurement", "measurements", "bust", "waist", "hip",
+        "xs", "xl", "cm", "inch", "사이즈", "핏", "치수",
     ],
     "shipping_returns": [
-        "shipping", "delivery", "return", "returns", "exchange", "refund", "ship", "배송", "반품", "교환", "환불",
+        "shipping", "delivery", "return", "returns", "exchange", "refund", "ship",
+        "배송", "반품", "교환", "환불",
     ],
     "promotions": [
-        "discount", "promo", "promotion", "coupon", "code", "sale", "deal", "할인", "프로모션", "쿠폰",
+        "discount", "promo", "promotion", "coupon", "code", "sale", "deal",
+        "할인", "프로모션", "쿠폰", "세일",
     ],
     "rewards": [
-        "reward", "rewards", "points", "membership", "tier", "vip", "포인트", "멤버십", "등급",
+        "reward", "rewards", "points", "membership", "tier", "vip",
+        "포인트", "멤버십", "등급",
     ],
     "availability": [
-        "available", "availability", "in stock", "out of stock", "restock", "sold out", "inventory", "재고", "품절", "입고",
+        "available", "availability", "in stock", "out of stock", "restock", "sold out", "inventory",
+        "재고", "품절", "입고", "리스탁",
     ],
     "about": [
-        "about", "brand", "story", "who are you", "who is", "ceo", "브랜드", "스토리", "소개",
+        "about", "brand", "story", "who are you", "who is", "ceo",
+        "브랜드", "스토리", "소개",
     ],
 }
 
@@ -321,6 +343,7 @@ def retrieve_context(
             blocks.append(f"[Doc{i} score={s:.2f} file={fn}]\n{d.page_content.strip()}")
         return "\n\n".join(blocks)
     except Exception:
+        # fallback if relevance scores not supported in the environment
         try:
             hits = vectorstore.similarity_search(query, k=k, filter=filt)
         except Exception:
@@ -381,6 +404,7 @@ def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, 
     if context.strip():
         return answer_grounded(user_text, context), intent_key, True
 
+    # Optional: broader search if the scenario intent is too narrow
     if intent_key not in ("none", "other"):
         broader = retrieve_context(user_text, intent_key=None, k=6, min_score=0.45)
         if broader.strip():
@@ -390,9 +414,33 @@ def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, 
 
 
 # -------------------------
+# Log session start ONCE (sessions table)
+# -------------------------
+def log_session_start_once():
+    if st.session_state.session_started_logged:
+        return
+    ts_now = datetime.datetime.utcnow().isoformat() + "Z"
+    try:
+        supabase.table(TBL_SESSIONS).upsert({
+            "session_id": st.session_state.session_id,
+            "ts_start": ts_now,
+            "identity_option": identity_option,
+            "brand_type": brand_type,
+            "name_present": "present" if show_name else "absent",
+            "image_present": "present" if show_picture else "absent",
+        }).execute()
+        st.session_state.session_started_logged = True
+    except Exception as e:
+        st.error(f"Supabase session start logging failed: {e}")
+        st.stop()
+
+
+# -------------------------
 # Greeting
 # -------------------------
 if not st.session_state.greeted_once:
+    log_session_start_once()
+
     greet_text = (
         "Hi, I'm Skyler, Style Loom’s virtual assistant. "
         "Style Loom is a start-up fashion brand founded three years ago, known for its entrepreneurial spirit and innovative approach. "
@@ -417,6 +465,7 @@ if st.session_state.active_scenario is None and selected != "— Select a scenar
 
 st.divider()
 
+
 # -------------------------
 # Render chat history
 # -------------------------
@@ -424,12 +473,14 @@ for spk, msg in st.session_state.chat_history:
     with st.chat_message("assistant" if spk == chatbot_speaker() else "user"):
         st.markdown(msg)
 
+
 # -------------------------
 # Chat input
 # -------------------------
 user_text = None
 if not st.session_state.ended:
     user_text = st.chat_input("Type your message here...")
+
 
 # -------------------------
 # End button and rating
@@ -444,10 +495,16 @@ with end_col2:
     if st.session_state.user_turns < MIN_USER_TURNS and (not st.session_state.ended):
         st.caption(f"Please complete at least {MIN_USER_TURNS} user turns before ending the chat.")
 
+
+# -------------------------
+# Save on Submit rating and save (ONLY ONCE)
+# -------------------------
 if st.session_state.ended and not st.session_state.rating_saved:
     rating = st.slider("Overall satisfaction with the chatbot (1 = very low, 7 = very high)", 1, 7, 4)
     prolific_id = st.text_input("Prolific ID (optional)")
+
     if st.button("Submit rating and save"):
+        # Build transcript text (single text blob + switch log)
         transcript_lines = []
         transcript_lines.append(f"Session ID: {st.session_state.session_id}")
         transcript_lines.append(f"Prolific ID: {prolific_id.strip() if prolific_id.strip() else 'N/A'}")
@@ -460,22 +517,32 @@ if st.session_state.ended and not st.session_state.rating_saved:
         transcript_lines.append("---- Chat transcript ----")
         for spk, msg in st.session_state.chat_history:
             transcript_lines.append(f"{spk}: {msg}")
-        transcript_lines.append("---- Rating ----")
-        transcript_lines.append(f"Satisfaction (1-7): {rating}")
         transcript_text = "\n".join(transcript_lines)
 
         ts_now = datetime.datetime.utcnow().isoformat() + "Z"
-        if supabase:
-            supabase.table("transcripts").insert({
+
+        # Save transcript, session end, and rating
+        try:
+            # 1) transcripts: store transcript_text
+            supabase.table(TBL_TRANSCRIPTS).insert({
                 "session_id": st.session_state.session_id,
                 "ts": ts_now,
                 "transcript_text": transcript_text,
             }).execute()
 
-            supabase.table("sessions").upsert({
+            # 2) ratings: store satisfaction separately
+            supabase.table(TBL_RATINGS).insert({
                 "session_id": st.session_state.session_id,
-                "ts_start": ts_now,
+                "ts": ts_now,
+                "prolific_id": prolific_id.strip() if prolific_id.strip() else None,
+                "satisfaction": int(rating),
+            }).execute()
+
+            # 3) sessions: store end time + turns + prolific_id
+            supabase.table(TBL_SESSIONS).upsert({
+                "session_id": st.session_state.session_id,
                 "ts_end": ts_now,
+                "prolific_id": prolific_id.strip() if prolific_id.strip() else None,
                 "identity_option": identity_option,
                 "brand_type": brand_type,
                 "name_present": "present" if show_name else "absent",
@@ -484,20 +551,27 @@ if st.session_state.ended and not st.session_state.rating_saved:
                 "bot_turns": st.session_state.bot_turns,
             }).execute()
 
-        st.session_state.rating_saved = True
-        st.success("Saved. Thank you.")
+            st.session_state.rating_saved = True
+            st.success("Saved. Thank you.")
+
+        except Exception as e:
+            st.error(f"Saving to Supabase failed: {e}")
+            st.stop()
 
 
 # -------------------------
 # Main interaction
 # -------------------------
-if user_text:
+if user_text and not st.session_state.ended:
+    # Append user message
     st.session_state.chat_history.append(("User", user_text))
     st.session_state.user_turns += 1
 
+    # Determine current active scenario (dropdown is a hint)
     user_selected = selected if selected != "— Select a scenario —" else None
     active = st.session_state.active_scenario or user_selected or "Other"
 
+    # Detect intent and (Option C) auto-switch scenario if needed
     detected_intent = detect_intent(user_text)
     detected_scenario = INTENT_TO_SCENARIO.get(detected_intent) if detected_intent else None
 
@@ -518,12 +592,15 @@ if user_text:
 
     st.session_state.active_scenario = active
 
+    # Generate answer (KB-first, then GPT fallback)
     answer, used_intent, used_kb = generate_answer(user_text, scenario=active)
+
+    # Add one-sentence disclosure if auto-switched
     if auto_switched and disclosure:
         answer = f"{disclosure}\n\n{answer}"
 
+    # Append assistant message
     st.session_state.chat_history.append((chatbot_speaker(), answer))
     st.session_state.bot_turns += 1
 
     st.rerun()
-
