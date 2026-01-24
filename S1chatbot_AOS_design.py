@@ -431,33 +431,46 @@ def log_session_start_once():
 
     st.session_state.session_started_logged = True
 
-
 # -------------------------
-# Greeting
+# Greeting (first assistant message)
 # -------------------------
 if not st.session_state.greeted_once:
     log_session_start_once()
+
     greet_text = (
         "Hi, I'm Skyler, Style Loom’s virtual assistant. "
-        "Style Loom is a start-up fashion brand founded three years ago, known for its entrepreneurial spirit and innovative approach. "
-        "I can help with product availability, sizing, shipping and returns, promotions, and more."
+        "Style Loom is a mass-market fashion brand founded twenty years ago, "
+        "known for its accessibility and broad consumer reach. "
+        "I’m here to help with your shopping."
     )
+
     st.session_state.chat_history.append((chatbot_speaker(), greet_text))
     st.session_state.greeted_once = True
 
 
 # -------------------------
-# UI: scenario dropdown
+# UI: scenario dropdown (after greeting)
 # -------------------------
+st.markdown("**How can I help you today?**")
+
 selected = st.selectbox(
-    "Choose a topic (optional). You can also ask naturally, and I will route your question to the right topic.",
+    "Choose a topic:",
     options=SCENARIOS,
     index=SCENARIOS.index(st.session_state.last_user_selected_scenario)
     if st.session_state.last_user_selected_scenario in SCENARIOS else 0,
 )
+
+# Track last selection
+prev_selected = st.session_state.last_user_selected_scenario
 st.session_state.last_user_selected_scenario = selected
-if st.session_state.active_scenario is None and selected != "— Select a scenario —":
+
+# One-time confirmation message when user selects a category
+# (only when selection changes AND not the placeholder)
+if selected != "— Select a scenario —" and selected != prev_selected:
     st.session_state.active_scenario = selected
+
+    confirm_text = f"Sure, I will help you with **{selected}**. Please ask me a question."
+    st.session_state.chat_history.append((chatbot_speaker(), confirm_text))
 
 st.divider()
 
