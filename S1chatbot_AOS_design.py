@@ -95,7 +95,7 @@ supabase = get_supabase()
 # Session state
 # -------------------------
 defaults = {
-    "chat_history": [],                      # List[Tuple[speaker, message]]
+    "chat_history": [],                       # List[Tuple[speaker, message]]
     "session_id": uuid.uuid4().hex[:10],
     "greeted_once": False,
     "ended": False,
@@ -103,9 +103,11 @@ defaults = {
     "user_turns": 0,
     "bot_turns": 0,
     "last_user_selected_scenario": "— Select a scenario —",
-    "active_scenario": None,                 # scenario used to answer (can auto-switch)
-    "switch_log": [],                        # list of dicts
-    "session_started_logged": False,          # ensure sessions.ts_start is logged once
+    "active_scenario": None,                  # scenario used to answer (can auto-switch)
+    "switch_log": [],                         # list of dicts
+    "session_started_logged": False,           # ensure sessions.ts_start is logged once
+    "last_kb_context": "",                     # for follow-up continuity
+    "last_intent_used": None,                  # for follow-up continuity
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -113,21 +115,23 @@ for k, v in defaults.items():
 
 
 # -------------------------
-# Branding and identity (Study 1: with name and image, start-up)
+# Branding and identity (Study condition)
 # -------------------------
 identity_option = "With name and image"
 show_name = True
 show_picture = True
 CHATBOT_NAME = "Skyler"
 CHATBOT_PICTURE = "https://i.imgur.com/4uLz4FZ.png"
-brand_type = "Start-up Brand"
+
+# IMPORTANT: keep this consistent with your greeting manipulation
+brand_type = "Mass-market Brand"
 
 def chatbot_speaker() -> str:
     return CHATBOT_NAME if show_name else "Assistant"
 
 
 # -------------------------
-# Header UI
+# Header UI (only place where image/name appear; chat itself is text-only)
 # -------------------------
 st.markdown(
     "<div style='display:flex;align-items:center;gap:8px;margin:8px 0 4px 0;'>"
@@ -170,7 +174,7 @@ SCENARIO_TO_INTENT = {
     "— Select a scenario —": "none",
 }
 
-# Map intent to knowledge files (optional)
+# Map intent to knowledge files (deterministic fallback loads these files)
 INTENT_TO_FILES = {
     "availability": [
         "availability_playbook.md",
@@ -215,36 +219,30 @@ def scenario_to_intent(scenario: Optional[str]) -> str:
 
 
 # -------------------------
-# Intent detection (rule-based) for auto-switching (Option C)
+# Intent detection (rule-based) for auto-switching (Option C) - ENGLISH ONLY
 # -------------------------
 INTENT_KEYWORDS: Dict[str, List[str]] = {
     "new_arrivals": [
         "new drop", "new arrivals", "new arrival", "new collection", "latest", "this season",
-        "신상", "새로 나온", "신규", "이번 시즌",
     ],
     "size_fit": [
         "size", "sizing", "fit", "measurement", "measurements", "bust", "waist", "hip",
-        "xs", "xl", "cm", "inch", "사이즈", "핏", "치수",
+        "xs", "xl", "cm", "inch",
     ],
     "shipping_returns": [
         "shipping", "delivery", "return", "returns", "exchange", "refund", "ship",
-        "배송", "반품", "교환", "환불",
     ],
     "promotions": [
         "discount", "promo", "promotion", "coupon", "code", "sale", "deal",
-        "할인", "프로모션", "쿠폰", "세일",
     ],
     "rewards": [
         "reward", "rewards", "points", "membership", "tier", "vip",
-        "포인트", "멤버십", "등급",
     ],
     "availability": [
         "available", "availability", "in stock", "out of stock", "restock", "sold out", "inventory",
-        "재고", "품절", "입고", "리스탁",
     ],
     "about": [
         "about", "brand", "story", "who are you", "who is", "ceo",
-        "브랜드", "스토리", "소개",
     ],
 }
 
@@ -319,12 +317,11 @@ def build_vectorstore(data_dir: Path) -> Optional[Chroma]:
 
 vectorstore = build_vectorstore(DATA_DIR)
 
-
 def retrieve_context(
     query: str,
     intent_key: Optional[str],
-    k: int = 6,
-    min_score: float = 0.35,
+    k: int = 8,
+    min_score: float = 0.25,
 ) -> str:
     if not vectorstore:
         return ""
@@ -333,6 +330,7 @@ def retrieve_context(
     if intent_key and intent_key not in ("none", "other"):
         filt = {"intent": intent_key}
 
+    # Prefer relevance-scored search when available
     try:
         hits = vectorstore.similarity_search_with_relevance_scores(query, k=k, filter=filt)
         filtered = [(d, s) for (d, s) in hits if s is not None and s >= min_score]
@@ -359,6 +357,36 @@ def retrieve_context(
 
 
 # -------------------------
+# Deterministic fallback context loader (scenario files)
+# -------------------------
+FOLLOWUP_ACK_PAT = re.compile(
+    r"^(sure|yes|yeah|yep|ok|okay|go ahead|please do|do it|sounds good|tell me|show me)\b",
+    re.IGNORECASE,
+)
+
+def is_generic_followup(text: str) -> bool:
+    t = (text or "").strip()
+    # short confirmations are common in multi-turn; treat as follow-up
+    return (len(t) <= 18) and bool(FOLLOWUP_ACK_PAT.search(t))
+
+def load_intent_files_as_context(intent_key: str) -> str:
+    files = INTENT_TO_FILES.get(intent_key, [])
+    if not files:
+        return ""
+    blocks = []
+    for fn in files:
+        fp = DATA_DIR / fn
+        if fp.exists():
+            try:
+                content = fp.read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                content = ""
+            if content:
+                blocks.append(f"[FILE: {fn}]\n{content}")
+    return "\n\n".join(blocks)
+
+
+# -------------------------
 # LLM helpers
 # -------------------------
 def llm_chat(messages: List[Dict[str, str]], temperature: float = 0.3) -> str:
@@ -369,20 +397,25 @@ def llm_chat(messages: List[Dict[str, str]], temperature: float = 0.3) -> str:
     )
     return (resp.choices[0].message.content or "").strip()
 
+def answer_grounded(user_text: str, context: str, intent_key: Optional[str] = None) -> str:
+    system = f"""You are Style Loom's virtual assistant for a fashion retail study.
+You MUST use the BUSINESS CONTEXT below as your source of truth.
 
-def answer_grounded(user_text: str, context: str) -> str:
-    system = """You are Style Loom's virtual assistant for a fashion retail study.
-Use the BUSINESS CONTEXT as the primary source.
-If the context does not contain the needed specifics, do not guess.
-Instead, ask one concise follow-up question.
-Keep answers short and clear."""
+Rules:
+- If the user asks about a policy (e.g., returns, shipping, discounts, rewards), provide a concise, concrete summary first.
+- Include key constraints (e.g., time window, condition requirements, eligibility, processing time) if present in the context.
+- Do NOT ask a follow-up question if the context already contains enough information to answer.
+- If the context truly does not contain the needed specifics, ask ONE concise follow-up question.
+
+Keep the answer short, direct, and helpful.
+Intent: {intent_key or "unknown"}.
+"""
     msgs = [
         {"role": "system", "content": system},
         {"role": "system", "content": f"BUSINESS CONTEXT:\n{context}"},
         {"role": "user", "content": user_text},
     ]
     return llm_chat(msgs, temperature=0.2)
-
 
 def answer_fallback(user_text: str) -> str:
     system = """You are Style Loom's virtual assistant.
@@ -392,24 +425,51 @@ Keep the response brief and natural."""
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
     return llm_chat(msgs, temperature=0.5)
 
-
 def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, bool]:
-    """Returns (answer, used_intent, used_kb)."""
+    """
+    Returns (answer, used_intent, used_kb).
+
+    Fixes:
+    1) Follow-up continuity: if user says "Sure/Yes/Go ahead", reuse last KB context.
+    2) Scenario stability: if vector retrieval is weak, load the scenario files directly.
+    """
     intent_key = scenario_to_intent(scenario)
 
-    if not vectorstore:
+    # Follow-up: reuse prior context
+    if is_generic_followup(user_text) and st.session_state.get("last_kb_context", "").strip():
+        ctx = st.session_state["last_kb_context"]
+        used_intent = st.session_state.get("last_intent_used") or intent_key
+        ans = answer_grounded(user_text, ctx, intent_key=used_intent)
+        return ans, used_intent, True
+
+    # Try vector retrieval scoped to scenario
+    context = ""
+    used_kb = False
+
+    if vectorstore:
+        context = retrieve_context(user_text, intent_key=intent_key, k=8, min_score=0.25)
+        if context.strip():
+            used_kb = True
+
+    # Deterministic fallback: load all scenario files (prevents "I don't know" loops)
+    if not context.strip() and intent_key not in ("none", "other"):
+        context = load_intent_files_as_context(intent_key)
+        if context.strip():
+            used_kb = True
+
+    # If still nothing, use GPT fallback
+    if not context.strip():
+        st.session_state["last_kb_context"] = ""
+        st.session_state["last_intent_used"] = intent_key
         return answer_fallback(user_text), intent_key, False
 
-    context = retrieve_context(user_text, intent_key=intent_key, k=6, min_score=0.35)
-    if context.strip():
-        return answer_grounded(user_text, context), intent_key, True
+    ans = answer_grounded(user_text, context, intent_key=intent_key)
 
-    if intent_key not in ("none", "other"):
-        broader = retrieve_context(user_text, intent_key=None, k=6, min_score=0.45)
-        if broader.strip():
-            return answer_grounded(user_text, broader), intent_key, True
+    # Persist for next follow-up
+    st.session_state["last_kb_context"] = context
+    st.session_state["last_intent_used"] = intent_key
 
-    return answer_fallback(user_text), intent_key, False
+    return ans, intent_key, used_kb
 
 
 # -------------------------
@@ -426,10 +486,11 @@ def log_session_start_once():
         "identity_option": identity_option,
         "brand_type": brand_type,
         "name_present": "present" if show_name else "absent",
-        "picture_present": "present" if show_picture else "absent",
+        "picture_present": "present" if show_picture else "absent",  # matches SQL
     }).execute()
 
     st.session_state.session_started_logged = True
+
 
 # -------------------------
 # Greeting (first assistant message)
@@ -443,7 +504,6 @@ if not st.session_state.greeted_once:
         "known for its accessibility and broad consumer reach. "
         "I’m here to help with your shopping."
     )
-
     st.session_state.chat_history.append((chatbot_speaker(), greet_text))
     st.session_state.greeted_once = True
 
@@ -464,15 +524,16 @@ selected = st.selectbox(
 prev_selected = st.session_state.last_user_selected_scenario
 st.session_state.last_user_selected_scenario = selected
 
-# One-time confirmation message when user selects a category
-# (only when selection changes AND not the placeholder)
+# One-time confirmation when user selects a category
 if selected != "— Select a scenario —" and selected != prev_selected:
     st.session_state.active_scenario = selected
-
     confirm_text = f"Sure, I will help you with **{selected}**. Please ask me a question."
     st.session_state.chat_history.append((chatbot_speaker(), confirm_text))
+    # Optional: uncomment if you want the confirmation to appear immediately before typing
+    # st.rerun()
 
 st.divider()
+
 
 # -------------------------
 # Render chat history (NO icons, text-only for experimental control)
@@ -482,6 +543,7 @@ for spk, msg in st.session_state.chat_history:
         st.markdown(f"**{CHATBOT_NAME}:** {msg}")
     else:
         st.markdown(f"**User:** {msg}")
+
 
 # -------------------------
 # Chat input
@@ -515,7 +577,6 @@ if st.session_state.ended and not st.session_state.rating_saved:
     if st.button("Submit rating and save"):
         ts_now = datetime.datetime.utcnow().isoformat() + "Z"
 
-        # Build transcript text (single blob)
         transcript_lines = []
         transcript_lines.append(f"Session ID: {st.session_state.session_id}")
         transcript_lines.append(f"Identity option: {identity_option}")
@@ -536,7 +597,7 @@ if st.session_state.ended and not st.session_state.rating_saved:
             "transcript_text": transcript_text,
         }).execute()
 
-        # 2) Save rating (separate table)
+        # 2) Save rating
         supabase.table(TBL_SATISFACTION).insert({
             "session_id": st.session_state.session_id,
             "ts": ts_now,
@@ -594,4 +655,5 @@ if user_text and not st.session_state.ended:
     st.session_state.bot_turns += 1
 
     st.rerun()
+
 
