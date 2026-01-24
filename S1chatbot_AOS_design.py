@@ -1,21 +1,21 @@
 # =========================
-# Style Loom Chatbot Experiment (Dropdown + Auto Switch + KB-grounded Answers + GPT Fallback)
-# Option C: Auto-switch to the most relevant topic, add a one-sentence disclosure, and log switches.
+# Style Loom Chatbot Experiment
+# Dropdown + Auto Switch (Option C) + KB-grounded Answers (LangChain) + GPT Fallback
+# Supabase (REQUIRED): save ONLY at end (sessions + transcripts + satisfaction)
 #
-# Folder requirement (recommended for Streamlit/GitHub):
-#   - Put knowledge files under: ./data/
-#   - Example: data/about.md, data/new_drop.md, data/size_chart.md, ...
+# Folder requirement:
+#   ./data/  (md/json knowledge files)
 #
-# Secrets requirement (Streamlit Secrets):
-#   - OPENAI_API_KEY
-#   - SUPABASE_URL
-#   - SUPABASE_ANON_KEY
+# Streamlit Secrets required:
+#   OPENAI_API_KEY
+#   SUPABASE_URL
+#   SUPABASE_ANON_KEY
 #
-# Storage policy:
-#   - Save ONLY when user ends chat and clicks "Submit rating and save"
-#   - Save transcript to "transcripts" table
-#   - Save session meta to "sessions" table
-#   - Save rating to separate "ratings" table
+# Supabase tables (must exist):
+#   public.sessions(session_id, ts_start, ts_end, identity_option, brand_type,
+#                   name_present, picture_present, scenario, user_turns, bot_turns)
+#   public.transcripts(id, session_id, ts, transcript_text)
+#   public.satisfaction(id, session_id, ts, rating)
 # =========================
 
 import os
@@ -28,7 +28,6 @@ from typing import Optional, Dict, List, Tuple
 
 import streamlit as st
 from openai import OpenAI
-
 from supabase import create_client  # Supabase is REQUIRED
 
 # LangChain / Vector
@@ -58,10 +57,10 @@ MODEL_CHAT = "gpt-4o-mini"
 MODEL_EMBED = "text-embedding-3-small"
 MIN_USER_TURNS = 5
 
-# Supabase tables (change only if your table names differ)
-TBL_TRANSCRIPTS = "transcripts"
+# Supabase tables (match your SQL exactly)
 TBL_SESSIONS = "sessions"
-TBL_RATINGS = "ratings"
+TBL_TRANSCRIPTS = "transcripts"
+TBL_SATISFACTION = "satisfaction"
 
 
 # -------------------------
@@ -106,7 +105,7 @@ defaults = {
     "last_user_selected_scenario": "— Select a scenario —",
     "active_scenario": None,                 # scenario used to answer (can auto-switch)
     "switch_log": [],                        # list of dicts
-    "session_started_logged": False,          # ensure ts_start logged once
+    "session_started_logged": False,          # ensure sessions.ts_start is logged once
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -158,6 +157,7 @@ SCENARIOS = [
     "Other",
 ]
 
+# Map scenario to intent key (internal)
 SCENARIO_TO_INTENT = {
     "Check product availability": "availability",
     "Shipping & returns": "shipping_returns",
@@ -170,6 +170,7 @@ SCENARIO_TO_INTENT = {
     "— Select a scenario —": "none",
 }
 
+# Map intent to knowledge files (optional)
 INTENT_TO_FILES = {
     "availability": [
         "availability_playbook.md",
@@ -343,7 +344,6 @@ def retrieve_context(
             blocks.append(f"[Doc{i} score={s:.2f} file={fn}]\n{d.page_content.strip()}")
         return "\n\n".join(blocks)
     except Exception:
-        # fallback if relevance scores not supported in the environment
         try:
             hits = vectorstore.similarity_search(query, k=k, filter=filt)
         except Exception:
@@ -404,7 +404,6 @@ def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, 
     if context.strip():
         return answer_grounded(user_text, context), intent_key, True
 
-    # Optional: broader search if the scenario intent is too narrow
     if intent_key not in ("none", "other"):
         broader = retrieve_context(user_text, intent_key=None, k=6, min_score=0.45)
         if broader.strip():
@@ -414,25 +413,23 @@ def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, 
 
 
 # -------------------------
-# Log session start ONCE (sessions table)
+# Supabase: log session start ONCE
 # -------------------------
 def log_session_start_once():
     if st.session_state.session_started_logged:
         return
+
     ts_now = datetime.datetime.utcnow().isoformat() + "Z"
-    try:
-        supabase.table(TBL_SESSIONS).upsert({
-            "session_id": st.session_state.session_id,
-            "ts_start": ts_now,
-            "identity_option": identity_option,
-            "brand_type": brand_type,
-            "name_present": "present" if show_name else "absent",
-            "image_present": "present" if show_picture else "absent",
-        }).execute()
-        st.session_state.session_started_logged = True
-    except Exception as e:
-        st.error(f"Supabase session start logging failed: {e}")
-        st.stop()
+    supabase.table(TBL_SESSIONS).upsert({
+        "session_id": st.session_state.session_id,
+        "ts_start": ts_now,
+        "identity_option": identity_option,
+        "brand_type": brand_type,
+        "name_present": "present" if show_name else "absent",
+        "picture_present": "present" if show_picture else "absent",
+    }).execute()
+
+    st.session_state.session_started_logged = True
 
 
 # -------------------------
@@ -440,7 +437,6 @@ def log_session_start_once():
 # -------------------------
 if not st.session_state.greeted_once:
     log_session_start_once()
-
     greet_text = (
         "Hi, I'm Skyler, Style Loom’s virtual assistant. "
         "Style Loom is a start-up fashion brand founded three years ago, known for its entrepreneurial spirit and innovative approach. "
@@ -483,9 +479,10 @@ if not st.session_state.ended:
 
 
 # -------------------------
-# End button and rating
+# End button and rating UI
 # -------------------------
 end_col1, end_col2 = st.columns([1, 2])
+
 with end_col1:
     can_end = (st.session_state.user_turns >= MIN_USER_TURNS) and (not st.session_state.ended)
     if st.button("End chat", disabled=not can_end):
@@ -497,21 +494,21 @@ with end_col2:
 
 
 # -------------------------
-# Save on Submit rating and save (ONLY ONCE)
+# Save ONLY at the end (transcripts + satisfaction + sessions end)
 # -------------------------
 if st.session_state.ended and not st.session_state.rating_saved:
     rating = st.slider("Overall satisfaction with the chatbot (1 = very low, 7 = very high)", 1, 7, 4)
-    prolific_id = st.text_input("Prolific ID (optional)")
 
     if st.button("Submit rating and save"):
-        # Build transcript text (single text blob + switch log)
+        ts_now = datetime.datetime.utcnow().isoformat() + "Z"
+
+        # Build transcript text (single blob)
         transcript_lines = []
         transcript_lines.append(f"Session ID: {st.session_state.session_id}")
-        transcript_lines.append(f"Prolific ID: {prolific_id.strip() if prolific_id.strip() else 'N/A'}")
         transcript_lines.append(f"Identity option: {identity_option}")
         transcript_lines.append(f"Brand type: {brand_type}")
         transcript_lines.append(f"Name present: {'present' if show_name else 'absent'}")
-        transcript_lines.append(f"Image present: {'present' if show_picture else 'absent'}")
+        transcript_lines.append(f"Picture present: {'present' if show_picture else 'absent'}")
         transcript_lines.append("---- Switch log ----")
         transcript_lines.append(json.dumps(st.session_state.switch_log, ensure_ascii=False))
         transcript_lines.append("---- Chat transcript ----")
@@ -519,59 +516,43 @@ if st.session_state.ended and not st.session_state.rating_saved:
             transcript_lines.append(f"{spk}: {msg}")
         transcript_text = "\n".join(transcript_lines)
 
-        ts_now = datetime.datetime.utcnow().isoformat() + "Z"
+        # 1) Save transcript
+        supabase.table(TBL_TRANSCRIPTS).insert({
+            "session_id": st.session_state.session_id,
+            "ts": ts_now,
+            "transcript_text": transcript_text,
+        }).execute()
 
-        # Save transcript, session end, and rating
-        try:
-            # 1) transcripts: store transcript_text
-            supabase.table(TBL_TRANSCRIPTS).insert({
-                "session_id": st.session_state.session_id,
-                "ts": ts_now,
-                "transcript_text": transcript_text,
-            }).execute()
+        # 2) Save rating (separate table)
+        supabase.table(TBL_SATISFACTION).insert({
+            "session_id": st.session_state.session_id,
+            "ts": ts_now,
+            "rating": int(rating),
+        }).execute()
 
-            # 2) ratings: store satisfaction separately
-            supabase.table(TBL_RATINGS).insert({
-                "session_id": st.session_state.session_id,
-                "ts": ts_now,
-                "prolific_id": prolific_id.strip() if prolific_id.strip() else None,
-                "satisfaction": int(rating),
-            }).execute()
+        # 3) Update session end + turns + scenario
+        supabase.table(TBL_SESSIONS).upsert({
+            "session_id": st.session_state.session_id,
+            "ts_end": ts_now,
+            "scenario": st.session_state.active_scenario or (selected if selected != "— Select a scenario —" else "Other"),
+            "user_turns": st.session_state.user_turns,
+            "bot_turns": st.session_state.bot_turns,
+        }).execute()
 
-            # 3) sessions: store end time + turns + prolific_id
-            supabase.table(TBL_SESSIONS).upsert({
-                "session_id": st.session_state.session_id,
-                "ts_end": ts_now,
-                "prolific_id": prolific_id.strip() if prolific_id.strip() else None,
-                "identity_option": identity_option,
-                "brand_type": brand_type,
-                "name_present": "present" if show_name else "absent",
-                "image_present": "present" if show_picture else "absent",
-                "user_turns": st.session_state.user_turns,
-                "bot_turns": st.session_state.bot_turns,
-            }).execute()
-
-            st.session_state.rating_saved = True
-            st.success("Saved. Thank you.")
-
-        except Exception as e:
-            st.error(f"Saving to Supabase failed: {e}")
-            st.stop()
+        st.session_state.rating_saved = True
+        st.success("Saved. Thank you.")
 
 
 # -------------------------
 # Main interaction
 # -------------------------
 if user_text and not st.session_state.ended:
-    # Append user message
     st.session_state.chat_history.append(("User", user_text))
     st.session_state.user_turns += 1
 
-    # Determine current active scenario (dropdown is a hint)
     user_selected = selected if selected != "— Select a scenario —" else None
     active = st.session_state.active_scenario or user_selected or "Other"
 
-    # Detect intent and (Option C) auto-switch scenario if needed
     detected_intent = detect_intent(user_text)
     detected_scenario = INTENT_TO_SCENARIO.get(detected_intent) if detected_intent else None
 
@@ -592,15 +573,12 @@ if user_text and not st.session_state.ended:
 
     st.session_state.active_scenario = active
 
-    # Generate answer (KB-first, then GPT fallback)
     answer, used_intent, used_kb = generate_answer(user_text, scenario=active)
-
-    # Add one-sentence disclosure if auto-switched
     if auto_switched and disclosure:
         answer = f"{disclosure}\n\n{answer}"
 
-    # Append assistant message
     st.session_state.chat_history.append((chatbot_speaker(), answer))
     st.session_state.bot_turns += 1
 
     st.rerun()
+
