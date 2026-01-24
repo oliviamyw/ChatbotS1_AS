@@ -461,14 +461,14 @@ if st.session_state.active_scenario is None and selected != "— Select a scenar
 
 st.divider()
 
-
 # -------------------------
-# Render chat history
+# Render chat history (NO icons, text-only for experimental control)
 # -------------------------
 for spk, msg in st.session_state.chat_history:
-    with st.chat_message("assistant" if spk == chatbot_speaker() else "user"):
-        st.markdown(msg)
-
+    if spk == chatbot_speaker():
+        st.markdown(f"**{CHATBOT_NAME}:** {msg}")
+    else:
+        st.markdown(f"**User:** {msg}")
 
 # -------------------------
 # Chat input
