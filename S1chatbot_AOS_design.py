@@ -592,42 +592,54 @@ with end_col2:
 # -------------------------
 # Save ONLY at the end
 # -------------------------
+# -------------------------
+# Save ONLY at the end (transcripts + satisfaction + sessions end)
+# -------------------------
 if st.session_state.ended and not st.session_state.rating_saved:
-    rating = st.slider(
-        "Overall satisfaction with the chatbot (1 = very low, 7 = very high)",
-        1, 7, 4
-    )
-
+    rating = st.slider("Overall satisfaction with the chatbot (1 = very low, 7 = very high)", 1, 7, 4)
     prolific_id = st.text_input("Prolific ID", value="")
 
     if st.button("Submit rating and save"):
         ts_now = datetime.datetime.utcnow().isoformat() + "Z"
 
-        # Transcript blob
+        final_scenario = st.session_state.active_scenario or (
+            selected if selected != "— Select a scenario —" else "Other"
+        )
+
+        # ===== Transcript text (human-readable; same style as your older version) =====
         transcript_lines = []
-        transcript_lines.append(f"Session ID: {st.session_state.session_id}")
-        transcript_lines.append(f"Prolific ID: {prolific_id.strip() if prolific_id.strip() else 'N/A'}")
-        transcript_lines.append(f"Identity option: {identity_option}")
-        transcript_lines.append(f"Brand type: {brand_type}")
-        transcript_lines.append(f"Name present: {'present' if show_name else 'absent'}")
-        transcript_lines.append(f"Picture present: {'present' if show_picture else 'absent'}")
-        transcript_lines.append(f"Scenario (final): {st.session_state.active_scenario or 'Other'}")
-        transcript_lines.append(f"Availability product type (final): {st.session_state.active_product_type or 'N/A'}")
+        transcript_lines.append("===== Session Transcript =====")
+        transcript_lines.append(f"timestamp       : {ts_now}")
+        transcript_lines.append(f"session_id      : {st.session_state.session_id}")
+        transcript_lines.append(f"identity_option : {identity_option}")
+        transcript_lines.append(f"brand_type      : {brand_type}")
+        transcript_lines.append(f"name_present    : {'present' if show_name else 'absent'}")
+        transcript_lines.append(f"picture_present : {'present' if show_picture else 'absent'}")
+        transcript_lines.append(f"scenario        : {final_scenario}")
+        transcript_lines.append(f"user_turns      : {st.session_state.user_turns}")
+        transcript_lines.append(f"bot_turns       : {st.session_state.bot_turns}")
+        transcript_lines.append(f"prolific_id     : {(prolific_id.strip() or 'N/A')}")
+        transcript_lines.append("")
         transcript_lines.append("---- Switch log ----")
         transcript_lines.append(json.dumps(st.session_state.switch_log, ensure_ascii=False))
+        transcript_lines.append("")
         transcript_lines.append("---- Chat transcript ----")
         for spk, msg in st.session_state.chat_history:
             transcript_lines.append(f"{spk}: {msg}")
+        transcript_lines.append("")
+        transcript_lines.append(f"Satisfaction (1-7): {int(rating)}")
+
         transcript_text = "\n".join(transcript_lines)
 
-        # 1) Save transcript
+        # 1) Save transcript (NOW includes satisfaction column)
         supabase.table(TBL_TRANSCRIPTS).insert({
             "session_id": st.session_state.session_id,
             "ts": ts_now,
             "transcript_text": transcript_text,
+            "satisfaction": int(rating),   # <-- NEW COLUMN in transcripts
         }).execute()
 
-        # 2) Save rating
+        # 2) Save rating in separate table (keep this)
         supabase.table(TBL_SATISFACTION).insert({
             "session_id": st.session_state.session_id,
             "ts": ts_now,
@@ -638,12 +650,10 @@ if st.session_state.ended and not st.session_state.rating_saved:
         supabase.table(TBL_SESSIONS).upsert({
             "session_id": st.session_state.session_id,
             "ts_end": ts_now,
-            "prolific_id": (prolific_id.strip() if prolific_id.strip() else None),
-            "scenario": st.session_state.active_scenario or (
-                selected if selected != "— Select a scenario —" else "Other"
-            ),
+            "scenario": final_scenario,
             "user_turns": st.session_state.user_turns,
             "bot_turns": st.session_state.bot_turns,
+            "prolific_id": prolific_id.strip() or None,
         }).execute()
 
         st.session_state.rating_saved = True
