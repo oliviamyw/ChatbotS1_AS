@@ -577,21 +577,36 @@ with end_col1:
         st.session_state.ended = True
 
 with end_col2:
-    if st.session_state.user_turns < MIN_USER_TURNS and (not st.session_state.ended):
-        st.caption(f"Please complete at least {MIN_USER_TURNS} user turns before ending the chat.")
+    if not st.session_state.ended:
+        completed = st.session_state.user_turns
+        remaining = max(0, MIN_USER_TURNS - completed)
 
+        if remaining > 0:
+            st.caption(
+                f"Please complete at least {MIN_USER_TURNS} user turns before ending the chat. "
+                f"Progress: {completed}/{MIN_USER_TURNS} (need {remaining} more)."
+            )
+        else:
+            st.caption(f"Progress: {completed}/{MIN_USER_TURNS}. You can end the chat now.")
 
 # -------------------------
 # Save ONLY at the end
 # -------------------------
 if st.session_state.ended and not st.session_state.rating_saved:
-    rating = st.slider("Overall satisfaction with the chatbot (1 = very low, 7 = very high)", 1, 7, 4)
+    rating = st.slider(
+        "Overall satisfaction with the chatbot (1 = very low, 7 = very high)",
+        1, 7, 4
+    )
+
+    prolific_id = st.text_input("Prolific ID", value="")
 
     if st.button("Submit rating and save"):
         ts_now = datetime.datetime.utcnow().isoformat() + "Z"
 
+        # Transcript blob
         transcript_lines = []
         transcript_lines.append(f"Session ID: {st.session_state.session_id}")
+        transcript_lines.append(f"Prolific ID: {prolific_id.strip() if prolific_id.strip() else 'N/A'}")
         transcript_lines.append(f"Identity option: {identity_option}")
         transcript_lines.append(f"Brand type: {brand_type}")
         transcript_lines.append(f"Name present: {'present' if show_name else 'absent'}")
@@ -605,29 +620,34 @@ if st.session_state.ended and not st.session_state.rating_saved:
             transcript_lines.append(f"{spk}: {msg}")
         transcript_text = "\n".join(transcript_lines)
 
+        # 1) Save transcript
         supabase.table(TBL_TRANSCRIPTS).insert({
             "session_id": st.session_state.session_id,
             "ts": ts_now,
             "transcript_text": transcript_text,
         }).execute()
 
+        # 2) Save rating
         supabase.table(TBL_SATISFACTION).insert({
             "session_id": st.session_state.session_id,
             "ts": ts_now,
             "rating": int(rating),
         }).execute()
 
+        # 3) Update session end + turns + scenario + prolific_id
         supabase.table(TBL_SESSIONS).upsert({
             "session_id": st.session_state.session_id,
             "ts_end": ts_now,
-            "scenario": st.session_state.active_scenario or (selected if selected != "— Select a scenario —" else "Other"),
+            "prolific_id": (prolific_id.strip() if prolific_id.strip() else None),
+            "scenario": st.session_state.active_scenario or (
+                selected if selected != "— Select a scenario —" else "Other"
+            ),
             "user_turns": st.session_state.user_turns,
             "bot_turns": st.session_state.bot_turns,
         }).execute()
 
         st.session_state.rating_saved = True
         st.success("Saved. Thank you.")
-
 
 # -------------------------
 # Main interaction
