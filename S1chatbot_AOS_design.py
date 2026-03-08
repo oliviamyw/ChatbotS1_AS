@@ -526,8 +526,8 @@ def detect_subintent(user_text: str, intent_key: Optional[str], active_item: Opt
     return None
 
 
-def pick_ack(turn_index: int) -> str:
-    return ACK_ROTATION[turn_index % len(ACK_ROTATION)]
+def pick_ack(turn_idx: int) -> str:
+    return ""
 
 
 def extract_last_question(text_block: str) -> Optional[str]:
@@ -697,7 +697,7 @@ def is_specific_availability_query(text: str) -> bool:
 
 
 # -------------------------
-# Availability 응답: exact inventory DB가 없어도 자연스러운 stock-style reply를 제공
+# Availability responses: stock-style first, with handoff to size/fit KB when needed
 # -------------------------
 _AVAIL_COLOR_ALIASES = {
     "navy": "navy",
@@ -711,74 +711,57 @@ _AVAIL_COLOR_ALIASES = {
     "blue": "blue",
     "brown": "brown",
     "green": "green",
+    "yellow": "yellow",
+    "cream": "cream",
+    "pink": "pink",
+    "red": "red",
+    "purple": "purple",
+    "orange": "orange",
 }
-_AVAIL_ATTR_KEYWORDS = {
-    "pleated": ["pleat", "pleated", "pleats"],
-    "european": ["european", "euro", "italian", "french"],
-    "slim": ["slim", "trim"],
-    "tapered": ["taper", "tapered"],
-    "regular": ["regular", "classic"],
-    "high_rise": ["high rise", "high-rise"],
-    "mid_rise": ["mid rise", "mid-rise"],
-    "low_rise": ["low rise", "low-rise"],
-    "maxi": ["maxi"],
-    "midi": ["midi"],
-    "mini": ["mini"],
-    "casual": ["casual", "daytime", "day time", "everyday"],
-    "dressy": ["dressy", "formal", "occasion", "evening"],
-}
+
+
+def _availability_wants_size_help(text: str) -> bool:
+    t = (text or "").lower()
+    return any(phrase in t for phrase in [
+        "size chart", "sizing chart", "size guide", "sizing guide",
+        "what size", "which size", "measurements", "measurement",
+        "fit guide", "fit guidance"
+    ])
 
 
 def _update_availability_state(user_text: str) -> dict:
     state = st.session_state.get("availability_state") or {
-        "product": None,       # e.g., pants, shirt, outerwear, dress, suiting
+        "product": None,
         "colors": set(),
-        "size": None,          # raw size string
-        "attrs": set(),        # e.g., pleated, european
+        "size": None,
         "turns": 0,
-        "disclaimer_shown": False,
     }
     t = (user_text or "").lower().strip()
-
-    # If the user gives a short follow-up like "yellow" or "yellow ones",
-    # preserve the previously discussed product instead of resetting to a generic category.
     previous_product = state.get("product")
 
-    # broad product inference (run first; can be overridden by more specific matches below)
-    if any(w in t for w in [
-        "coat", "coats", "overcoat", "trench", "parka", "puffer", "outerwear", "raincoat", "topcoat", "jacket", "jackets"
-    ]):
-        state["product"] = "outerwear"
+    # product inference
     if any(w in t for w in ["dress", "dresses", "sundress", "gown", "maxi", "midi", "mini"]):
         state["product"] = "dress"
-
-    # product inference
-    if any(w in t for w in ["pants", "trousers", "slacks"]):
+    elif any(w in t for w in ["coat", "coats", "overcoat", "trench", "parka", "puffer", "outerwear", "raincoat", "topcoat", "jacket", "jackets"]):
+        state["product"] = "outerwear"
+    elif any(w in t for w in ["pants", "trousers", "slacks"]):
         state["product"] = "pants"
     elif any(w in t for w in ["shirt", "shirts", "button-down", "button down", "dress shirt", "blouse", "top", "tops"]):
         state["product"] = "shirt"
     elif any(w in t for w in ["suit", "blazer", "sport coat", "suiting"]):
         state["product"] = "suiting"
 
-    # If user only said "ones" / a color / a size, keep prior product context.
     if state.get("product") is None and previous_product:
         if any(word in t for word in ["one", "ones", "that", "those", "yellow", "white", "black", "navy", "blue", "red", "green", "gray", "grey", "beige", "brown", "pink", "purple", "orange", "cream", "ivory"]):
             state["product"] = previous_product
 
-    # colors
     for k, v in _AVAIL_COLOR_ALIASES.items():
-        if k in t:
+        if re.search(rf"{k}", t):
             state["colors"].add(v)
 
-    # sizes
     sz = extract_size(t)
     if sz:
         state["size"] = sz
-
-    # attributes
-    for attr, kws in _AVAIL_ATTR_KEYWORDS.items():
-        if any(kw in t for kw in kws):
-            state["attrs"].add(attr)
 
     state["turns"] = int(state.get("turns", 0)) + 1
     st.session_state["availability_state"] = state
@@ -786,122 +769,74 @@ def _update_availability_state(user_text: str) -> dict:
 
 
 def _availability_next_question(state: dict) -> Optional[str]:
-    """Ask only one light follow-up, focused on checking availability rather than recommending."""
     product = state.get("product")
     colors = state.get("colors", set())
     size = state.get("size")
-    attrs = state.get("attrs", set())
 
     if not product:
-        return "Would you like me to check **dresses**, **tops**, **bottoms**, or **outerwear**?"
+        return "Would you like me to check dresses, tops, bottoms, or outerwear?"
 
-    if product == "dress":
-        if not colors:
-            return "Would you like me to check a specific color as well?"
-        if size is None:
-            return "Would you like me to check a particular size too?"
-        return "Would you like me to check another color or size as well?"
-
-    if product == "outerwear":
-        if not colors:
-            return "Would you like to check a specific color as well?"
-        if size is None:
-            return "Would you like me to check a particular size too?"
-        return "Would you like to check another coat style, color, or size as well?"
-
-    if product == "pants":
-        if not colors:
-            return "Would you like to check a specific color as well?"
-        if size is None:
-            return "Would you like me to check a particular size too?"
-        return "Would you like me to check another color or size too?"
-
-    if product in {"shirt", "suiting"}:
-        if not colors:
-            return "Would you like me to check a specific color as well?"
-        if size is None:
-            return "Would you like me to check a particular size too?"
-        return "Would you like me to check another style, color, or size too?"
-
-    return "Would you like me to check a specific color or size as well?"
+    if not colors:
+        return "Would you like me to check a specific color as well?"
+    if size is None:
+        return "Would you like me to check a particular size too?"
+    return "Would you like me to check another color or size as well?"
 
 
 def _availability_summary(state: dict) -> str:
     product = state.get("product")
     colors = sorted(list(state.get("colors", set())))
     size = state.get("size")
-    attrs = state.get("attrs", set())
 
-    if product == "pants":
-        noun = "trousers"
-    elif product == "shirt":
-        noun = "shirts"
-    elif product == "suiting":
-        noun = "suiting pieces"
-    elif product == "outerwear":
-        noun = "coats"
-    elif product == "dress":
-        noun = "dresses"
-    else:
-        noun = "items"
+    noun = {
+        "pants": "trousers",
+        "shirt": "shirts",
+        "suiting": "suiting pieces",
+        "outerwear": "coats",
+        "dress": "dresses",
+    }.get(product, "items")
 
-    bits = []
     if colors:
-        bits.append(" ".join(colors) + f" {noun}")
+        base = " ".join(colors) + f" {noun}"
     else:
-        bits.append(noun)
-
-    if "maxi" in attrs:
-        bits.append("in a maxi length")
-    elif "midi" in attrs:
-        bits.append("in a midi length")
-    elif "mini" in attrs:
-        bits.append("in a mini length")
-
+        base = noun
     if size:
-        bits.append(f"in size {size}")
-    if "pleated" in attrs:
-        bits.append("with pleats")
-    if "european" in attrs:
-        bits.append("with a European-style look")
-    if "casual" in attrs:
-        bits.append("for a casual daytime look")
-    elif "dressy" in attrs:
-        bits.append("for a dressier occasion")
-
-    return " ".join(bits).strip()
+        return f"{base} in size {size}"
+    return base
 
 
 def build_availability_consult_reply(user_text: str) -> str:
-    """Study 1 availability should sound like flexible stock checking, not a recommendation bot."""
+    """Study 1 availability should sound like stock checking, not a recommendation bot."""
     state = _update_availability_state(user_text)
     t = (user_text or "").lower()
-
-    is_count_q = bool(re.search(r"\bhow many\b|\bnumber of\b|\bstock count\b|\bin stock\b", t))
-    has_color = bool(state.get("colors"))
-    has_size = bool(state.get("size"))
-    has_attrs = bool(state.get("attrs"))
-    has_specifics = has_color or has_size or has_attrs
+    product = state.get("product")
     summary = _availability_summary(state)
     q = _availability_next_question(state)
-    product = state.get("product")
+    is_count_q = bool(re.search(r"how many|number of|stock count|in stock", t))
+    colors = state.get("colors", set())
+    size = state.get("size")
 
     if is_count_q:
-        if has_specifics:
-            lead = f"We currently have limited to moderate stock for {summary}."
-        elif product == "dress":
-            lead = "We currently have several women's dresses in stock."
-        elif product == "outerwear":
-            lead = "We currently have several outerwear options in stock."
-        elif product == "pants":
-            lead = "We currently have several trouser options in stock."
-        elif product == "shirt":
-            lead = "We currently have several shirt options in stock."
-        elif product == "suiting":
-            lead = "We currently have several suiting options in stock."
+        if product:
+            lead = f"We currently have several {summary} available."
         else:
             lead = "We currently have several options available in that category."
         return f"{lead} {q}".strip()
+
+    if product == "dress":
+        lead = f"Yes, we currently have a few {summary} available." if colors or size else "Yes, we currently have several women's dresses available."
+    elif product == "outerwear":
+        lead = f"Yes, we currently have a few {summary} available." if colors or size else "Yes, we currently have several outerwear options available."
+    elif product == "pants":
+        lead = f"Yes, we currently have a few {summary} available." if colors or size else "Yes, we currently have several trouser options available."
+    elif product == "shirt":
+        lead = f"Yes, we currently have a few {summary} available." if colors or size else "Yes, we currently have several shirt options available."
+    elif product == "suiting":
+        lead = f"Yes, we currently have a few {summary} available." if colors or size else "Yes, we currently have several suiting options available."
+    else:
+        lead = "Yes, we currently have several options available in that category."
+
+    return f"{lead} {q}".strip()
 
     if product == "dress":
         if has_specifics:
@@ -983,14 +918,18 @@ def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, 
         return answer_fallback(user_text, intent_key=used_intent), used_intent, False
 
     # -------------------------
-    # Availability: 상담형(컨설팅) 응답으로 전환 (DB/RAG 없을 때도 반복 루프 방지)
+    # Availability: stock-style responses, but hand off sizing/fit questions to KB+LLM
     # -------------------------
     if intent_key == "availability":
-        reply = build_availability_consult_reply(user_text)
-        st.session_state["last_kb_context"] = ""
-        st.session_state["last_intent_used"] = intent_key
-        st.session_state["last_subintent_used"] = subintent
-        return reply.strip(), intent_key, False
+        if _availability_wants_size_help(user_text):
+            intent_key = "size_fit"
+            subintent = detect_subintent(user_text, intent_key, active_item=active_item)
+        else:
+            reply = build_availability_consult_reply(user_text)
+            st.session_state["last_kb_context"] = ""
+            st.session_state["last_intent_used"] = intent_key
+            st.session_state["last_subintent_used"] = subintent
+            return reply.strip(), intent_key, False
 
     # -------------------------
     # Retrieval query shaping (improves relevance without exposing internal routing)
@@ -1330,6 +1269,8 @@ if user_text and not st.session_state.ended:
     st.session_state.bot_turns += 1
 
     st.rerun()
+
+
 
 
 
