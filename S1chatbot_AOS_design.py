@@ -728,6 +728,7 @@ _AVAIL_ATTR_KEYWORDS = {
     "dressy": ["dressy", "formal", "occasion", "evening"],
 }
 
+
 def _update_availability_state(user_text: str) -> dict:
     state = st.session_state.get("availability_state") or {
         "product": None,       # e.g., pants, shirt, outerwear, dress, suiting
@@ -737,26 +738,35 @@ def _update_availability_state(user_text: str) -> dict:
         "turns": 0,
         "disclaimer_shown": False,
     }
-    t = (user_text or "").lower()
+    t = (user_text or "").lower().strip()
+
+    # If the user gives a short follow-up like "yellow" or "yellow ones",
+    # preserve the previously discussed product instead of resetting to a generic category.
+    previous_product = state.get("product")
 
     # broad product inference (run first; can be overridden by more specific matches below)
     if any(w in t for w in [
-        "coat", "coats", "overcoat", "trench", "parka", "puffer", "outerwear", "raincoat", "topcoat"
+        "coat", "coats", "overcoat", "trench", "parka", "puffer", "outerwear", "raincoat", "topcoat", "jacket", "jackets"
     ]):
         state["product"] = "outerwear"
-    if any(w in t for w in ["dress", "dresses", "sundress", "gown", "maxi", "midi"]):
+    if any(w in t for w in ["dress", "dresses", "sundress", "gown", "maxi", "midi", "mini"]):
         state["product"] = "dress"
 
     # product inference
     if any(w in t for w in ["pants", "trousers", "slacks"]):
         state["product"] = "pants"
-    elif any(w in t for w in ["shirt", "shirts", "button-down", "button down", "dress shirt"]):
+    elif any(w in t for w in ["shirt", "shirts", "button-down", "button down", "dress shirt", "blouse", "top", "tops"]):
         state["product"] = "shirt"
     elif any(w in t for w in ["suit", "blazer", "sport coat", "suiting"]):
         state["product"] = "suiting"
 
+    # If user only said "ones" / a color / a size, keep prior product context.
+    if state.get("product") is None and previous_product:
+        if any(word in t for word in ["one", "ones", "that", "those", "yellow", "white", "black", "navy", "blue", "red", "green", "gray", "grey", "beige", "brown", "pink", "purple", "orange", "cream", "ivory"]):
+            state["product"] = previous_product
+
     # colors
-    for k,v in _AVAIL_COLOR_ALIASES.items():
+    for k, v in _AVAIL_COLOR_ALIASES.items():
         if k in t:
             state["colors"].add(v)
 
@@ -774,6 +784,7 @@ def _update_availability_state(user_text: str) -> dict:
     st.session_state["availability_state"] = state
     return state
 
+
 def _availability_next_question(state: dict) -> Optional[str]:
     """Ask only one light follow-up, focused on checking availability rather than recommending."""
     product = state.get("product")
@@ -782,34 +793,34 @@ def _availability_next_question(state: dict) -> Optional[str]:
     attrs = state.get("attrs", set())
 
     if not product:
-        return "Would you like to check **dresses**, **tops**, **bottoms**, or **outerwear**?"
+        return "Would you like me to check **dresses**, **tops**, **bottoms**, or **outerwear**?"
 
     if product == "dress":
         if not colors:
             return "Would you like me to check a specific color as well?"
         if size is None:
             return "Would you like me to check a particular size too?"
-        return "Would you like to check another color or size as well?"
+        return "Would you like me to check another color or size as well?"
 
     if product == "outerwear":
-        if size is None:
-            return "Would you like me to check a particular size too?"
         if not colors:
             return "Would you like to check a specific color as well?"
-        return "Would you like to check another coat style or size as well?"
+        if size is None:
+            return "Would you like me to check a particular size too?"
+        return "Would you like to check another coat style, color, or size as well?"
 
     if product == "pants":
-        if size is None:
-            return "Would you like me to check a particular size too?"
         if not colors:
             return "Would you like to check a specific color as well?"
-        return "Would you like me to check another fit, color, or size too?"
+        if size is None:
+            return "Would you like me to check a particular size too?"
+        return "Would you like me to check another color or size too?"
 
     if product in {"shirt", "suiting"}:
+        if not colors:
+            return "Would you like me to check a specific color as well?"
         if size is None:
             return "Would you like me to check a particular size too?"
-        if not colors:
-            return "Would you like to check a specific color as well?"
         return "Would you like me to check another style, color, or size too?"
 
     return "Would you like me to check a specific color or size as well?"
@@ -822,9 +833,9 @@ def _availability_summary(state: dict) -> str:
     attrs = state.get("attrs", set())
 
     if product == "pants":
-        noun = "tailored trousers"
+        noun = "trousers"
     elif product == "shirt":
-        noun = "dress shirts"
+        noun = "shirts"
     elif product == "suiting":
         noun = "suiting pieces"
     elif product == "outerwear":
@@ -866,41 +877,62 @@ def build_availability_consult_reply(user_text: str) -> str:
     state = _update_availability_state(user_text)
     t = (user_text or "").lower()
 
-    is_count_q = bool(re.search(r"how many|number of|stock count|how many.*in stock", t))
-    has_specifics = bool(state.get("colors")) or bool(state.get("size")) or bool(state.get("attrs"))
+    is_count_q = bool(re.search(r"\bhow many\b|\bnumber of\b|\bstock count\b|\bin stock\b", t))
+    has_color = bool(state.get("colors"))
+    has_size = bool(state.get("size"))
+    has_attrs = bool(state.get("attrs"))
+    has_specifics = has_color or has_size or has_attrs
     summary = _availability_summary(state)
     q = _availability_next_question(state)
+    product = state.get("product")
 
-    if state.get("product") == "dress" and has_specifics:
-        lead = f"Yes, we currently have a few {summary} available."
-    elif state.get("product") == "dress":
-        lead = "Yes, we currently have several women's dresses available."
-    elif state.get("product") == "outerwear" and has_specifics:
-        lead = f"Yes, we currently have a few {summary} available."
-    elif state.get("product") == "outerwear":
-        lead = "Yes, we currently have several coat options available."
-    elif state.get("product") == "pants" and has_specifics:
-        lead = f"Yes, we currently have a few {summary} available."
-    elif state.get("product") == "pants":
-        lead = "Yes, we currently have several trouser options available."
-    elif state.get("product") == "shirt" and has_specifics:
-        lead = f"Yes, we currently have a few {summary} available."
-    elif state.get("product") == "shirt":
-        lead = "Yes, we currently have several shirt options available."
-    elif state.get("product") == "suiting" and has_specifics:
-        lead = f"Yes, we currently have a few {summary} available."
-    elif state.get("product") == "suiting":
-        lead = "Yes, we currently have several suiting options available."
+    if is_count_q:
+        if has_specifics:
+            lead = f"We currently have limited to moderate stock for {summary}."
+        elif product == "dress":
+            lead = "We currently have several women's dresses in stock."
+        elif product == "outerwear":
+            lead = "We currently have several outerwear options in stock."
+        elif product == "pants":
+            lead = "We currently have several trouser options in stock."
+        elif product == "shirt":
+            lead = "We currently have several shirt options in stock."
+        elif product == "suiting":
+            lead = "We currently have several suiting options in stock."
+        else:
+            lead = "We currently have several options available in that category."
+        return f"{lead} {q}".strip()
+
+    if product == "dress":
+        if has_specifics:
+            lead = f"Yes, we currently have a few {summary} available."
+        else:
+            lead = "Yes, we currently have several women's dresses available."
+    elif product == "outerwear":
+        if has_specifics:
+            lead = f"Yes, we currently have a few {summary} available."
+        else:
+            lead = "Yes, we currently have several outerwear options available."
+    elif product == "pants":
+        if has_specifics:
+            lead = f"Yes, we currently have a few {summary} available."
+        else:
+            lead = "Yes, we currently have several trouser options available."
+    elif product == "shirt":
+        if has_specifics:
+            lead = f"Yes, we currently have a few {summary} available."
+        else:
+            lead = "Yes, we currently have several shirt options available."
+    elif product == "suiting":
+        if has_specifics:
+            lead = f"Yes, we currently have a few {summary} available."
+        else:
+            lead = "Yes, we currently have several suiting options available."
     else:
         lead = "Yes, we currently have several options available in that category."
 
-    if is_count_q:
-        if state.get("size") or state.get("colors") or state.get("attrs"):
-            lead = f"We currently have limited to moderate stock for {summary}."
-        else:
-            lead = "We currently have several options available in that category."
-
     return f"{lead} {q}".strip()
+
 
 def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, bool]:
     intent_key = scenario_to_intent(scenario)
@@ -1298,6 +1330,7 @@ if user_text and not st.session_state.ended:
     st.session_state.bot_turns += 1
 
     st.rerun()
+
 
 
 
