@@ -697,7 +697,7 @@ def is_specific_availability_query(text: str) -> bool:
 
 
 # -------------------------
-# Availability 상담형 응답: RAG/DB가 없어도 자연스럽게 "필터링/좁혀가기"를 제공
+# Availability 응답: exact inventory DB가 없어도 자연스러운 stock-style reply를 제공
 # -------------------------
 _AVAIL_COLOR_ALIASES = {
     "navy": "navy",
@@ -721,6 +721,11 @@ _AVAIL_ATTR_KEYWORDS = {
     "high_rise": ["high rise", "high-rise"],
     "mid_rise": ["mid rise", "mid-rise"],
     "low_rise": ["low rise", "low-rise"],
+    "maxi": ["maxi"],
+    "midi": ["midi"],
+    "mini": ["mini"],
+    "casual": ["casual", "daytime", "day time", "everyday"],
+    "dressy": ["dressy", "formal", "occasion", "evening"],
 }
 
 def _update_availability_state(user_text: str) -> dict:
@@ -770,93 +775,132 @@ def _update_availability_state(user_text: str) -> dict:
     return state
 
 def _availability_next_question(state: dict) -> Optional[str]:
-    # Ask at most one next question, prioritized to reduce loops.
+    """Ask only one light follow-up, focused on checking availability rather than recommending."""
+    product = state.get("product")
+    colors = state.get("colors", set())
+    size = state.get("size")
     attrs = state.get("attrs", set())
-    has_fit_pref = ("slim" in attrs) or ("regular" in attrs)
 
-    if state.get("product") == "pants":
-        if "pleated" in attrs:
-            return "Do you prefer a **single pleat** (subtle) or **double pleat** (more structure)?"
-        if "european" in attrs and (not has_fit_pref):
-            return "For a European look, would you prefer a **slim-tapered** fit or a more **classic/regular** fit?"
-        if not has_fit_pref:
-            return "Do you want a **slim-tapered** fit or a more **classic/regular** fit?"
-        # Next-best narrowing once fit is known
-        if not state.get("colors"):
-            return "Any color preference, such as **navy**, **black**, or **khaki**?"
-        return "Do you prefer a **mid-rise** or **high-rise**, or should the focus stay on a clean, classic look?"
-    if state.get("product") == "shirt":
-        if not has_fit_pref:
-            return "Do you prefer a **slim** fit or a more **regular** fit?"
-        # Next-best narrowing once fit is known
-        if not state.get("colors"):
-            return "Any color preference, such as **white**, **light blue**, or **navy**?"
-        return "Do you prefer a **crisper** feel or something **softer and more comfortable**?"
-    if state.get("product") == "outerwear":
-        return "What type of coat are you looking for: **wool overcoat**, **trench**, or **puffer/parka**?"
-    if state.get("product") == "dress":
-        if not state.get("colors"):
-            return "Any color preference, and do you prefer a **midi** or **maxi** length?"
-        return "Is this for a casual daytime look or a more **dressy** occasion?"
-    if state.get("product") == "suiting":
-        return "Are you looking for a **blazer/sport coat** or a full **suit**?"
-    return "Are you shopping for **tops**, **bottoms**, **outerwear**, or **dresses**?"
+    if not product:
+        return "Would you like to check **dresses**, **tops**, **bottoms**, or **outerwear**?"
 
-def build_availability_consult_reply(user_text: str) -> str:
-    prefix = pick_ack(int(st.session_state.get("bot_turns", 0) + 1))
-    state = _update_availability_state(user_text)
+    if product == "dress":
+        if not colors:
+            return "Would you like me to check a specific color as well?"
+        if size is None:
+            return "Would you like me to check a particular size too?"
+        return "Would you like to check another color or size as well?"
 
-    t = (user_text or "").lower()
-    is_count_q = bool(re.search(r"\bhow many\b|\bnumber of\b|\bstock count\b|\bhow many\b.*\bin stock\b", t))
+    if product == "outerwear":
+        if size is None:
+            return "Would you like me to check a particular size too?"
+        if not colors:
+            return "Would you like to check a specific color as well?"
+        return "Would you like to check another coat style or size as well?"
 
-    # short summary (no fake inventory counts)
+    if product == "pants":
+        if size is None:
+            return "Would you like me to check a particular size too?"
+        if not colors:
+            return "Would you like to check a specific color as well?"
+        return "Would you like me to check another fit, color, or size too?"
+
+    if product in {"shirt", "suiting"}:
+        if size is None:
+            return "Would you like me to check a particular size too?"
+        if not colors:
+            return "Would you like to check a specific color as well?"
+        return "Would you like me to check another style, color, or size too?"
+
+    return "Would you like me to check a specific color or size as well?"
+
+
+def _availability_summary(state: dict) -> str:
     product = state.get("product")
     colors = sorted(list(state.get("colors", set())))
     size = state.get("size")
     attrs = state.get("attrs", set())
 
-    bits = []
     if product == "pants":
-        bits.append("tailored trousers")
+        noun = "tailored trousers"
     elif product == "shirt":
-        bits.append("dress shirts")
+        noun = "dress shirts"
     elif product == "suiting":
-        bits.append("suiting pieces")
+        noun = "suiting pieces"
     elif product == "outerwear":
-        bits.append("men's coats")
+        noun = "coats"
     elif product == "dress":
-        bits.append("dresses")
+        noun = "dresses"
     else:
-        bits.append("items")
+        noun = "items"
 
+    bits = []
     if colors:
-        bits.append("in " + " and ".join(colors))
+        bits.append(" ".join(colors) + f" {noun}")
+    else:
+        bits.append(noun)
+
+    if "maxi" in attrs:
+        bits.append("in a maxi length")
+    elif "midi" in attrs:
+        bits.append("in a midi length")
+    elif "mini" in attrs:
+        bits.append("in a mini length")
+
     if size:
-        bits.append(f"(size {size})")
-    if "european" in attrs:
-        bits.append("with a European-style silhouette")
+        bits.append(f"in size {size}")
     if "pleated" in attrs:
         bits.append("with pleats")
+    if "european" in attrs:
+        bits.append("with a European-style look")
+    if "casual" in attrs:
+        bits.append("for a casual daytime look")
+    elif "dressy" in attrs:
+        bits.append("for a dressier occasion")
 
-    summary = " ".join(bits).strip()
+    return " ".join(bits).strip()
 
-    # Guidance: show full disclaimer once per availability flow to prevent repetitive loops.
-    if not state.get("disclaimer_shown"):
-        guidance = (
-            "I can help you narrow down what to look for. "
-            "This chat cannot display a live product list or exact stock counts, but you can use the filters on the product page to match your preferences."
-        )
-        state["disclaimer_shown"] = True
-        st.session_state["availability_state"] = state
-    else:
-        guidance = "I can help you narrow it down using one quick filter."
 
+def build_availability_consult_reply(user_text: str) -> str:
+    """Study 1 availability should sound like flexible stock checking, not a recommendation bot."""
+    state = _update_availability_state(user_text)
+    t = (user_text or "").lower()
+
+    is_count_q = bool(re.search(r"how many|number of|stock count|how many.*in stock", t))
+    has_specifics = bool(state.get("colors")) or bool(state.get("size")) or bool(state.get("attrs"))
+    summary = _availability_summary(state)
     q = _availability_next_question(state)
 
-    if is_count_q:
-        return f"{prefix} I can’t see a live stock count inside this chat. For {summary}, the fastest approach is filtering by category and size on the product page. {guidance} {q}".strip()
+    if state.get("product") == "dress" and has_specifics:
+        lead = f"Yes, we currently have a few {summary} available."
+    elif state.get("product") == "dress":
+        lead = "Yes, we currently have several women's dresses available."
+    elif state.get("product") == "outerwear" and has_specifics:
+        lead = f"Yes, we currently have a few {summary} available."
+    elif state.get("product") == "outerwear":
+        lead = "Yes, we currently have several coat options available."
+    elif state.get("product") == "pants" and has_specifics:
+        lead = f"Yes, we currently have a few {summary} available."
+    elif state.get("product") == "pants":
+        lead = "Yes, we currently have several trouser options available."
+    elif state.get("product") == "shirt" and has_specifics:
+        lead = f"Yes, we currently have a few {summary} available."
+    elif state.get("product") == "shirt":
+        lead = "Yes, we currently have several shirt options available."
+    elif state.get("product") == "suiting" and has_specifics:
+        lead = f"Yes, we currently have a few {summary} available."
+    elif state.get("product") == "suiting":
+        lead = "Yes, we currently have several suiting options available."
+    else:
+        lead = "Yes, we currently have several options available in that category."
 
-    return f"{prefix} For {summary}, {guidance} {q}".strip()
+    if is_count_q:
+        if state.get("size") or state.get("colors") or state.get("attrs"):
+            lead = f"We currently have limited to moderate stock for {summary}."
+        else:
+            lead = "We currently have several options available in that category."
+
+    return f"{lead} {q}".strip()
 
 def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, bool]:
     intent_key = scenario_to_intent(scenario)
