@@ -766,6 +766,8 @@ def build_availability_stock_reply(user_text: str) -> str:
     product = state.get("product")
     color = state.get("color")
     size = state.get("size")
+    t = (user_text or "").lower()
+    asks_how_many = any(p in t for p in ["how many", "how much stock", "in stock", "stock left", "left in stock"])
 
     if not product:
         return "Yes, we currently have several options available in that category. Would you like to check dresses, tops, bottoms, or outerwear?"
@@ -773,12 +775,22 @@ def build_availability_stock_reply(user_text: str) -> str:
     label = PRODUCT_LABELS.get(product, "items")
 
     if color and size:
-        return f"Yes, we currently have a few {color} {label} available in {size}. Would you like me to check another color or style as well?"
+        size_text = size if size in {"small", "medium", "large"} else size
+        if asks_how_many:
+            return f"It looks like we currently have 5+ {color} {label} available in {size_text}, so stock seems fairly open right now. I can also check another color or size if you'd like."
+        return f"Yes, it looks like we currently have 5+ {color} {label} available in {size_text}, so stock seems fairly open right now. I can also check another color or size if you'd like."
     if color:
-        return f"Yes, we currently have a few {color} {label} available. Would you like me to check a particular size too?"
+        if asks_how_many:
+            return f"It looks like we currently have a few {color} {label} available right now. If you'd like, I can also check a particular size."
+        return f"Yes, we currently have a few {color} {label} available right now. If you'd like, I can also check a particular size."
     if size:
-        return f"Yes, we currently have several {label} available in {size}. Would you like me to check a color as well?"
-    return f"Yes, we currently have several {label} available. Would you like me to check a specific color as well?"
+        size_text = size if size in {"small", "medium", "large"} else size
+        if asks_how_many:
+            return f"It looks like we currently have several {label} available in {size_text}. If you'd like, I can also check a color."
+        return f"Yes, we currently have several {label} available in {size_text}. If you'd like, I can also check a color."
+    if asks_how_many:
+        return f"It looks like we currently have several {label} available right now. If you'd like, I can also check a specific color or size."
+    return f"Yes, we currently have several {label} available right now. If you'd like, I can also check a specific color or size."
 
 def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, bool]:
     intent_key = scenario_to_intent(scenario)
@@ -1193,10 +1205,6 @@ if user_text and not st.session_state.ended:
     st.session_state.bot_turns += 1
 
     st.rerun()
-
-
-
-
 
 
 
