@@ -100,11 +100,11 @@ supabase = get_supabase()
 # -------------------------
 # Study condition (THIS CELL: Start-up / 3 years)
 # -------------------------
-identity_option = "No name and image"
-show_name = False
-show_picture = False
-CHATBOT_NAME = "Style Loom Assistant"
-CHATBOT_PICTURE = ""
+identity_option = "With name and image"
+show_name = True
+show_picture = True
+CHATBOT_NAME = "Skyler"
+CHATBOT_PICTURE = "https://i.imgur.com/4uLz4FZ.png"
 
 # IMPORTANT: these labels must match your manipulation and what you want stored in Supabase
 brand_type = "Start-up Brand"             # <-- Start-up condition label (Supabase 저장값)
@@ -112,7 +112,7 @@ BRAND_AGE_YEARS_TEXT = "three years ago"  # <-- Greeting 문장에 그대로 들
 
 
 def chatbot_speaker() -> str:
-    return "Style Loom Assistant"
+    return CHATBOT_NAME if show_name else "Assistant"
 
 
 # -------------------------
@@ -1023,7 +1023,7 @@ if not st.session_state.greeted_once:
     log_session_start_once()
 
     greet_text = (
-        "Hi, I'm Style Loom’s virtual assistant. "
+        "Hi, I'm Skyler, Style Loom’s virtual assistant. "
         "Style Loom is a start-up fashion brand founded three years ago, "
         "known for its entrepreneurial spirit and innovative approach. "
         "I’m here to help with your shopping."
