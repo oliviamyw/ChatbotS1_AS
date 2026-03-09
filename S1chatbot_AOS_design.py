@@ -647,7 +647,7 @@ _SIZE_NUM_CTX_RE = re.compile(
     re.IGNORECASE
 )
 _SIZE_SLASH_RE = re.compile(r"\b\d{1,2}/\d{1,2}\b")
-_BARE_SIZE_RE = re.compile(r"^\s*(xxs|xs|s|m|l|xl|xxl|small|medium|large)\s*[.!?]*\s*$", re.IGNORECASE)
+_BARE_SIZE_RE = re.compile(r"^\s*(?:a\s+|an\s+|size\s+|in\s+)?(xxs|xs|s|m|l|xl|xxl|small|medium|large)(?:\s+please)?\s*[.!?]*\s*$", re.IGNORECASE)
 
 SIZE_NORMALIZE = {
     "xxs": "XXS", "xs": "XS", "s": "S", "m": "M", "l": "L", "xl": "XL", "xxl": "XXL",
@@ -691,12 +691,17 @@ def extract_size_for_availability(text: str, has_active_product: bool = False) -
     if explicit:
         return explicit
     if has_active_product:
-        m = _BARE_SIZE_RE.match((text or "").strip())
+        raw_t = (text or "").strip().lower()
+        m = _BARE_SIZE_RE.match(raw_t)
         if m:
             raw = m.group(1).lower().replace(" ", "")
             return SIZE_NORMALIZE.get(raw, m.group(1))
+        short_tokens = re.findall(r"[a-zA-Z]+", raw_t)
+        if 1 <= len(short_tokens) <= 3:
+            for tok in short_tokens:
+                if tok in SIZE_NORMALIZE:
+                    return SIZE_NORMALIZE[tok]
     return None
-
 
 def detect_product_type(text: str) -> Optional[str]:
     t = (text or "").lower()
@@ -716,8 +721,11 @@ def detect_color(text: str) -> Optional[str]:
 
 def is_size_chart_query(text: str) -> bool:
     t = (text or "").lower()
-    return any(p in t for p in ["size chart", "sizing chart", "size guide", "measurements", "measurement", "fit guide"])
-
+    phrases = [
+        "size chart", "sizing chart", "size guide", "sizing guide", "fit guide",
+        "measurements", "measurement", "size info", "sizing info"
+    ]
+    return any(p in t for p in phrases)
 
 def is_specific_availability_query(text: str) -> bool:
     t = (text or "").lower()
@@ -824,6 +832,21 @@ def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, 
     # Availability: stock-style responses for Study 1, but allow size-chart questions to use KB
     # -------------------------
     if intent_key == "availability" and is_size_chart_query(user_text):
+        ctx = load_intent_files_as_context("size_fit")
+        if ctx.strip():
+            ans = answer_grounded(
+                user_text,
+                ctx,
+                intent_key="size_fit",
+                subintent=None,
+                recent_history=recent_history,
+                pending_question=pending_q,
+                include_ack=False,
+            )
+            st.session_state["last_kb_context"] = ctx
+            st.session_state["last_intent_used"] = "size_fit"
+            st.session_state["last_subintent_used"] = None
+            return ans, "size_fit", True
         intent_key = "size_fit"
         subintent = None
 
